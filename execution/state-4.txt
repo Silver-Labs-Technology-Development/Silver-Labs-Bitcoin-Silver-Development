@@ -1,0 +1,3 @@
+alice=885
+bob=85
+carol=30
