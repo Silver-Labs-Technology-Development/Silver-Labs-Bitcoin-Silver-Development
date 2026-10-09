@@ -1,0 +1,22 @@
+{
+  "profiles": {
+    "clean-genesis": {
+      "chain_id": "regtest-l2",
+      "activation_batch": 1,
+      "parent_batch_number": 0,
+      "parent_batch_hash": null,
+      "parent_state_hash": "dfdff9103fbd96a9e62c64ffbe32fcf569cf995c4dd5a1ea867c2c5fad4650fd",
+      "state_file": "settlement/v09/clean-recovery/genesis-state.txt"
+    },
+    "existing-history-migration": {
+      "chain_id": "regtest-l2",
+      "activation_batch": 3,
+      "parent_batch_number": 2,
+      "parent_batch_hash": "c9ebef2e044513ded4e9d25a6a8fc71d8fc2973578d531bcac1bd313fc2254a9",
+      "parent_state_hash": "16508f6aece3650f7e0fa6b8fae772a8574623f2dbccda26b93ed207f5b6a59b",
+      "state_file": "sequencer/state-result-2.txt",
+      "legacy_record_file": "sequencer/batch-exec-record.txt",
+      "legacy_payload_file": "settlement/v08/batch-2-payload.txt"
+    }
+  }
+}
