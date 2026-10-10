@@ -139,3 +139,35 @@ test('v1 batch rejects empty envelopes and unknown fields', async () => {
     )
   })
 })
+
+test('v1 batch and envelope commitments are deterministic for identical canonical blocks', async () => {
+  await withStore(async (directory) => {
+    const { envelopes } = await makeTwoBlockBatch(directory)
+
+    const rebuiltGenesis = createEvmSettlementEnvelope(
+      envelopes[0]!.blockRlpHex,
+    )
+    const rebuiltChild = createEvmSettlementEnvelope(
+      envelopes[1]!.blockRlpHex,
+      rebuiltGenesis.commitmentHash,
+    )
+
+    const originalBatch = createEvmSettlementBatch(envelopes)
+    const rebuiltBatch = createEvmSettlementBatch([
+      rebuiltGenesis,
+      rebuiltChild,
+    ])
+
+    assert.deepEqual([rebuiltGenesis, rebuiltChild], envelopes)
+    assert.deepEqual(rebuiltBatch, originalBatch)
+    assert.equal(rebuiltBatch.batchHash, originalBatch.batchHash)
+
+    const verified = verifyEvmSettlementBatch(
+      JSON.parse(JSON.stringify(rebuiltBatch)),
+      ZERO_COMMITMENT,
+      ZERO_HASH,
+      '0',
+    )
+    assert.equal(verified.batchHash, originalBatch.batchHash)
+  })
+})
