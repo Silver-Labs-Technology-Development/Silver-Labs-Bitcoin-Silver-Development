@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "rpc": "tsx src/rpcServer.ts",
     "demo": "tsx src/demo.ts",
-    "verify:batch": "tsx scripts/verify-settlement-batch.ts"
+    "verify:batch": "tsx scripts/verify-settlement-batch.ts",
+    "verify:batch:execution": "tsx scripts/verify-settlement-batch-execution.ts"
   },
   "dependencies": {
     "@ethereumjs/block": "10.1.3",

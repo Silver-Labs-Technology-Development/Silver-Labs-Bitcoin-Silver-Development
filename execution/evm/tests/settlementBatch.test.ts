@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import { PersistentBlockProcessor, ProtocolError } from '../src/blockProcessor.js'
 import { createEvmSettlementEnvelope, ZERO_COMMITMENT } from '../src/settlementEnvelope.js'
 import { createEvmSettlementBatch, verifyEvmSettlementBatch } from '../src/settlementBatch.js'
+import { verifyEvmSettlementBatchExecution } from '../src/settlementBatchReplay.js'
 
 const ZERO_HASH = `0x${'0'.repeat(64)}`
 
@@ -136,6 +137,42 @@ test('v1 batch rejects empty envelopes and unknown fields', async () => {
         '0',
       ),
       ProtocolError,
+    )
+  })
+})
+
+test('independent replay verifies a valid genesis-plus-child batch', async () => {
+  await withStore(async (directory) => {
+    const { batch } = await makeTwoBlockBatch(directory)
+
+    const report = await verifyEvmSettlementBatchExecution(
+      JSON.parse(JSON.stringify(batch)),
+      ZERO_COMMITMENT,
+      ZERO_HASH,
+      '0',
+    )
+
+    assert.equal(report.executionVerified, true)
+    assert.equal(report.blocksVerified, 2)
+    assert.equal(report.childBlocksReexecuted, 1)
+    assert.equal(report.startHeight, '0')
+    assert.equal(report.endHeight, '1')
+    assert.equal(report.batchHash, batch.batchHash)
+  })
+})
+
+test('independent replay rejects a batch that does not start at genesis', async () => {
+  await withStore(async (directory) => {
+    const { batch } = await makeTwoBlockBatch(directory)
+
+    await assert.rejects(
+      verifyEvmSettlementBatchExecution(
+        batch,
+        ZERO_COMMITMENT,
+        ZERO_HASH,
+        '1',
+      ),
+      /batch start height does not match the expected starting height/,
     )
   })
 })
