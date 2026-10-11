@@ -335,10 +335,25 @@ export class BtcsL1PublicationStore {
     )
   }
 
-  invalidate(batchHash: string): Promise<BtcsL1PublicationRecord> {
-    return this.update(batchHash, (current) =>
-      invalidateBtcsL1Publication(current),
-    )
+  invalidate(
+    batchHash: string,
+    expectedBlockHash?: string,
+  ): Promise<BtcsL1PublicationRecord> {
+    if (expectedBlockHash !== undefined) {
+      validateBatchHash(expectedBlockHash)
+    }
+
+    return this.update(batchHash, (current) => {
+      if (
+        expectedBlockHash !== undefined &&
+        current.blockHash !== expectedBlockHash
+      ) {
+        throw new ProtocolError(
+          'publication inclusion changed before invalidation',
+        )
+      }
+      return invalidateBtcsL1Publication(current)
+    })
   }
 
   private async update(

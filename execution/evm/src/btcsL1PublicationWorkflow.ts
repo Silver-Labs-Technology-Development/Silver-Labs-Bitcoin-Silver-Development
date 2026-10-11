@@ -1,4 +1,5 @@
 import { ProtocolError } from './blockProcessor.js'
+import { BtcsL1PublicationStore } from './btcsL1PublicationStore.js'
 import {
   verifyBtcsL1AnchorConfirmation,
   type BtcsL1ConfirmationRpc,
@@ -82,4 +83,86 @@ export async function verifyAndAdvanceBtcsL1Publication(
     report.blockHeight,
     report.confirmations,
   )
+}
+
+
+/**
+ * Verify an existing publication and persist its verified inclusion state.
+ *
+ * No record is changed if the RPC call or confirmation verification fails.
+ * The store's serialized transitions also reject stale/conflicting updates.
+ */
+export async function verifyAndAdvanceBtcsL1PublicationInStore(
+  rpc: BtcsL1ConfirmationRpc,
+  store: BtcsL1PublicationStore,
+  batchHash: string,
+  blockHash: string,
+): Promise<BtcsL1PublicationRecord> {
+  const current = store.get(batchHash)
+  if (current === undefined) {
+    throw new ProtocolError('publication does not exist for this batch hash')
+  }
+
+  const verified = await verifyAndAdvanceBtcsL1Publication(
+    rpc,
+    current,
+    blockHash,
+  )
+
+  if (
+    verified.blockHash === undefined ||
+    verified.blockHeight === undefined ||
+    verified.confirmations === undefined
+  ) {
+    throw new ProtocolError(
+      'verified publication is missing transaction inclusion data',
+    )
+  }
+
+  if (current.state === 'invalidated') {
+    return store.reobserve(
+      batchHash,
+      verified.blockHash,
+      verified.blockHeight,
+      verified.confirmations,
+    )
+  }
+
+  return store.observe(
+    batchHash,
+    verified.blockHash,
+    verified.blockHeight,
+    verified.confirmations,
+  )
+}
+
+/**
+ * Persist invalidation after the caller has independently established that
+ * the previously recorded inclusion was removed by a canonical-chain reorg.
+ *
+ * This function does not detect reorgs itself. Never call it solely because
+ * an RPC failed, timed out, or temporarily could not find a transaction.
+ * expectedPreviousBlockHash is rechecked inside the serialized store update.
+ */
+export async function invalidateBtcsL1PublicationAfterConfirmedReorg(
+  store: BtcsL1PublicationStore,
+  batchHash: string,
+  expectedPreviousBlockHash: string,
+): Promise<BtcsL1PublicationRecord> {
+  const current = store.get(batchHash)
+  if (current === undefined) {
+    throw new ProtocolError('publication does not exist for this batch hash')
+  }
+  if (current.state !== 'observed' && current.state !== 'confirmed') {
+    throw new ProtocolError(
+      'only an observed or confirmed publication can be invalidated after a reorg',
+    )
+  }
+  if (current.blockHash !== expectedPreviousBlockHash) {
+    throw new ProtocolError(
+      'publication inclusion changed before invalidation',
+    )
+  }
+
+  return store.invalidate(batchHash, expectedPreviousBlockHash)
 }
