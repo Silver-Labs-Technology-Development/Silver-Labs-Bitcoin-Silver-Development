@@ -35,7 +35,7 @@ test('rejects invalid hashes, confirmation targets, and illegal transitions', ()
 
   const prepared = createBtcsL1Publication(batchHash, 6)
   assert.throws(() => markBtcsL1PublicationSubmitted(prepared, 'bad'), /transaction ID/)
-  assert.throws(() => observeBtcsL1Publication(prepared, blockHash, 120, 1), /submitted or observed/)
+  assert.throws(() => observeBtcsL1Publication(prepared, blockHash, 120, 1), /submitted, observed, or confirmed/)
 })
 
 test('invalidating an observed publication clears its chain inclusion data', () => {
@@ -129,4 +129,23 @@ test('allows re-observation after explicit invalidation while retaining transact
   assert.equal(reobserved.state, 'observed')
   assert.equal(reobserved.blockHeight, 121)
   assert.equal(reobserved.blockHash, 'd'.repeat(64))
+})
+
+test('confirmed publication rejects confirmation regression and block changes', () => {
+  const submitted = markBtcsL1PublicationSubmitted(
+    createBtcsL1Publication(batchHash, 6),
+    txid,
+  )
+  const observed = observeBtcsL1Publication(submitted, blockHash, 120, 3)
+  const confirmed = observeBtcsL1Publication(observed, blockHash, 120, 6)
+
+  assert.equal(confirmed.state, 'confirmed')
+  assert.throws(
+    () => observeBtcsL1Publication(confirmed, blockHash, 120, 5),
+    /cannot decrease/,
+  )
+  assert.throws(
+    () => observeBtcsL1Publication(confirmed, 'd'.repeat(64), 121, 7),
+    /invalidate it before observing a new block/,
+  )
 })

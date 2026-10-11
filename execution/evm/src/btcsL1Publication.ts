@@ -152,8 +152,14 @@ export function observeBtcsL1Publication(
   confirmations: number,
 ): BtcsL1PublicationRecord {
   validateRecord(record)
-  if (record.state !== 'submitted' && record.state !== 'observed') {
-    throw new ProtocolError('only a submitted or observed publication can be observed')
+  if (
+    record.state !== 'submitted' &&
+    record.state !== 'observed' &&
+    record.state !== 'confirmed'
+  ) {
+    throw new ProtocolError(
+      'only a submitted, observed, or confirmed publication can be observed',
+    )
   }
 
   validateHash(blockHash, 'block hash')
@@ -164,13 +170,20 @@ export function observeBtcsL1Publication(
     throw new ProtocolError('an observed publication must have at least one confirmation')
   }
   if (
-    record.state === 'observed' &&
+    (record.state === 'observed' || record.state === 'confirmed') &&
     (record.blockHash !== blockHash || record.blockHeight !== blockHeight)
   ) {
-    throw new ProtocolError('publication inclusion changed; invalidate it before observing a new block')
+    throw new ProtocolError(
+      'publication inclusion changed; invalidate it before observing a new block',
+    )
   }
-  if (record.state === 'observed' && confirmations < (record.confirmations ?? 0)) {
-    throw new ProtocolError('confirmation count cannot decrease without explicit invalidation')
+  if (
+    (record.state === 'observed' || record.state === 'confirmed') &&
+    confirmations < (record.confirmations ?? 0)
+  ) {
+    throw new ProtocolError(
+      'confirmation count cannot decrease without explicit invalidation',
+    )
   }
 
   const next: BtcsL1PublicationRecord = {
