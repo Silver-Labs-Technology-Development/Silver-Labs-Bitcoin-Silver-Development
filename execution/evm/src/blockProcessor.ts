@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { lstat, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, unlink } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { createBlock, createBlockFromRLP } from '@ethereumjs/block'
 import type { Block } from '@ethereumjs/block'
 import { createFeeMarket1559TxFromRLP } from '@ethereumjs/tx'
 import type { FeeMarket1559Tx, TypedTransaction } from '@ethereumjs/tx'
 import {
+  Account,
   Address,
   KECCAK256_RLP,
   KECCAK256_RLP_ARRAY,
@@ -16,10 +17,14 @@ import {
   createZeroAddress,
   equalsBytes,
   hexToBytes,
+  unprefixedHexToBytes,
 } from '@ethereumjs/util'
+import { getActivePrecompiles } from '@ethereumjs/evm'
 import type { EVMMockBlockchainInterface } from '@ethereumjs/evm'
 import { buildBlock, createVM, encodeReceipt, runBlock } from '@ethereumjs/vm'
 import type { RunBlockResult, RunTxResult } from '@ethereumjs/vm'
+import { createStateCheckpoint, openDurableStateManager } from './stateCheckpoint.js'
+import type { StateCheckpointManifest } from './stateCheckpoint.js'
 import {
   EVM_CHAIN_ID,
   EVM_HARDFORK,
@@ -159,6 +164,8 @@ type ChainMetadata = {
   canonicalHeight: string
   canonicalTipHash: string
 }
+
+type ReplayStateManager = Awaited<ReturnType<typeof openDurableStateManager>>['stateManager']
 
 type ReplaySession = {
   vm: Awaited<ReturnType<typeof createVM>>
@@ -466,10 +473,31 @@ class CanonicalBlockHashLookup implements EVMMockBlockchainInterface {
   }
 }
 
-async function createExecutionVM() {
+async function createExecutionVM(stateManager?: ReplayStateManager) {
   const common = createHarnessCommon()
   const blockchain = new CanonicalBlockHashLookup()
-  const vm = await createVM({ common, blockchain, activatePrecompiles: true })
+  const vm = await createVM({
+    common,
+    blockchain,
+    activatePrecompiles: true,
+    ...(stateManager === undefined ? {} : { stateManager }),
+  })
+
+  // EthereumJS skips automatic precompile-account initialization when a
+  // custom state manager is supplied, so reproduce its initialization here.
+  if (stateManager !== undefined) {
+    for (const [addressStr] of getActivePrecompiles(common)) {
+      const address = new Address(unprefixedHexToBytes(addressStr))
+      if (await vm.stateManager.getAccount(address) === undefined) {
+        const account = new Account()
+        await vm.stateManager.putAccount(
+          address,
+          createAccount({ balance: 1, storageRoot: account.storageRoot }),
+        )
+      }
+    }
+  }
+
   await vm.stateManager.putAccount(
     SENDER_ADDRESS,
     createAccount({ balance: GENESIS_BALANCE }),
@@ -512,8 +540,8 @@ async function createGenesisBlock(vm: Awaited<ReturnType<typeof createVM>>): Pro
   )
 }
 
-async function makeGenesisSession() {
-  const { vm, common, blockchain } = await createExecutionVM()
+async function makeGenesisSession(stateManager?: ReplayStateManager) {
+  const { vm, common, blockchain } = await createExecutionVM(stateManager)
   const genesis = await createGenesisBlock(vm)
   await blockchain.putBlock(genesis)
   const genesisStateRoot = await vm.stateManager.getStateRoot()
@@ -1088,6 +1116,58 @@ export class PersistentBlockProcessor {
     return new CanonicalReadView(await this.replayCanonical())
   }
 
+  /**
+   * Export a durable checkpoint from a separate, fully verified canonical replay.
+   * This runs under the processor's exclusive-operation lock so the tip cannot
+   * change while replay and checkpoint publication are in progress.
+   */
+  async exportStateCheckpoint(checkpointDirectory: string): Promise<StateCheckpointManifest> {
+    return this.withExclusiveOperation(async () => {
+      const temporaryDirectory = await mkdtemp(
+        join(this.directory, '.state-checkpoint-export-'),
+      )
+      const sourceDatabasePath = join(temporaryDirectory, 'state-db')
+      let durable: Awaited<ReturnType<typeof openDurableStateManager>> | undefined
+
+      try {
+        durable = await openDurableStateManager(sourceDatabasePath)
+        const session = await this.replayCanonical(durable.stateManager)
+        const tipSummary = session.report.blocks.at(-1)
+
+        if (tipSummary === undefined || session.blocks.at(-1) === undefined) {
+          throw new ProtocolError('canonical replay has no tip state to checkpoint')
+        }
+
+        const stateRoot = asBytesHex(await session.vm.stateManager.getStateRoot())
+        if (stateRoot.toLowerCase() !== tipSummary.stateRoot.toLowerCase()) {
+          throw new ProtocolError(
+            `durable replay state root does not match canonical tip: expected ${tipSummary.stateRoot}, got ${stateRoot}`,
+          )
+        }
+
+        // Checkpoint creation requires the source database to be closed.
+        await durable.close()
+
+        return await createStateCheckpoint(
+          sourceDatabasePath,
+          resolve(checkpointDirectory),
+          {
+            profileId: LOCAL_CHAIN_PROFILE,
+            blockHeight: tipSummary.number,
+            blockHash: tipSummary.hash,
+            stateRoot,
+          },
+        )
+      } finally {
+        try {
+          await durable?.close()
+        } finally {
+          await rm(temporaryDirectory, { recursive: true, force: true })
+        }
+      }
+    })
+  }
+
   async getStorage(
     address: Address,
     slot: Uint8Array,
@@ -1296,9 +1376,9 @@ export class PersistentBlockProcessor {
     return reverse
   }
 
-  private async replayCanonical(): Promise<ReplaySession> {
+  private async replayCanonical(stateManager?: ReplayStateManager): Promise<ReplaySession> {
     const records = await this.loadCanonicalRecords()
-    const genesisSession = await makeGenesisSession()
+    const genesisSession = await makeGenesisSession(stateManager)
     const storedGenesis = records[0]?.record
     if (storedGenesis === undefined) throw new ProtocolError('canonical genesis record is missing')
     if (

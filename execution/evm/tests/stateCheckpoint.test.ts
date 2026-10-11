@@ -172,6 +172,24 @@ test('checkpoint restores durable EVM state and validates its manifest', async (
       openStateCheckpoint(checkpointPath),
       /Invalid checkpoint manifest/,
     )
+
+    // A valid manifest must not make a checkpoint with missing trie data acceptable.
+    await writeFile(manifestPath, validManifest)
+    const damagedStateDb = new ClassicLevel<string, Uint8Array>(
+      join(checkpointPath, 'state-db'),
+      { valueEncoding: 'view' },
+    )
+    await damagedStateDb.open()
+    try {
+      await damagedStateDb.clear()
+    } finally {
+      await damagedStateDb.close()
+    }
+
+    await assert.rejects(
+      openStateCheckpoint(checkpointPath),
+      /missing the manifest state root/,
+    )
   } finally {
     await rm(rootDir, { recursive: true, force: true })
   }

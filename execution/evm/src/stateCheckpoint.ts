@@ -116,21 +116,53 @@ function validateManifest(value: unknown): StateCheckpointManifest {
   return manifest as StateCheckpointManifest
 }
 
-function makeStateManager(
+async function makeStateManager(
   db: ClassicLevel<string, Uint8Array>,
-  root: Uint8Array,
-): MerkleStateManager {
+  root?: Uint8Array,
+): Promise<MerkleStateManager> {
+  const common = createHarnessCommon()
   const trie = new MerklePatriciaTrie({
     db: new ClassicLevelAdapter(db),
-    root,
+    common,
+    ...(root === undefined ? {} : { root }),
     useKeyHashing: true,
     valueEncoding: ValueEncoding.Bytes,
   })
 
+  if (root !== undefined && !(await trie.checkRoot(root))) {
+    throw new Error('Checkpoint trie database is missing the manifest state root')
+  }
+
   return new MerkleStateManager({
-    common: createHarnessCommon(),
+    common,
     trie,
   })
+}
+
+/**
+ * Open a fresh durable state database for a dedicated canonical replay.
+ * The caller must close it before passing its path to createStateCheckpoint.
+ */
+export async function openDurableStateManager(databasePath: string): Promise<{
+  stateManager: MerkleStateManager
+  close: () => Promise<void>
+}> {
+  const db = new ClassicLevel<string, Uint8Array>(databasePath, {
+    valueEncoding: "view",
+  })
+
+  try {
+    await db.open()
+    return {
+      stateManager: await makeStateManager(db),
+      close: async () => {
+        if (db.status === "open") await db.close()
+      },
+    }
+  } catch (error) {
+    if (db.status === "open") await db.close()
+    throw error
+  }
 }
 
 /**
@@ -213,7 +245,7 @@ export async function openStateCheckpoint(checkpointDirectory: string): Promise<
 
   try {
     await db.open()
-    const stateManager = makeStateManager(db, hexToBytes(manifest.stateRoot as `0x${string}`))
+    const stateManager = await makeStateManager(db, hexToBytes(manifest.stateRoot as `0x${string}`))
     const actualRoot = bytesToHex(await stateManager.getStateRoot())
 
     if (actualRoot.toLowerCase() !== manifest.stateRoot.toLowerCase()) {

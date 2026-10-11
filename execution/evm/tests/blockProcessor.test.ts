@@ -15,6 +15,7 @@ import {
   GENESIS_TIMESTAMP,
   MAX_SERIALIZED_BLOCK_BYTES,
   MAX_TRANSACTIONS_PER_BLOCK,
+  LOCAL_CHAIN_PROFILE,
   PersistentBlockProcessor,
   ProtocolError,
   type PersistenceStage,
@@ -27,6 +28,7 @@ import {
 } from '../src/config.js'
 import { compileCounter } from '../src/compile.js'
 import { signFeeMarketTransaction } from '../src/transactions.js'
+import { recoverStateCheckpoint } from '../src/stateCheckpointRecovery.js'
 
 function eventTopic(signature: string): string {
   return bytesToHex(keccak_256(utf8ToBytes(signature)))
@@ -178,6 +180,60 @@ test('deploys Counter in a block and increments it in the next block', async () 
     assert.deepEqual(log.topics, [eventTopic('Incremented(uint256)')])
     assert.equal(log.data, `0x${'00'.repeat(31)}01`)
     assert.equal(chain.tip.hash, incremented.summary.hash)
+  })
+})
+
+test('canonical replay exports a recoverable durable checkpoint with contract state', async () => {
+  await withStore(async (directory) => {
+    const chain = await PersistentBlockProcessor.open(directory)
+    const { contractAddress, deployment, increment } = contractTransactions()
+
+    const deployed = await chain.buildNextBlock([deployment], GENESIS_TIMESTAMP + 1n)
+    assert.equal(deployed.summary.receipts[0]?.status, 1)
+
+    const incremented = await chain.buildNextBlock([increment], GENESIS_TIMESTAMP + 2n)
+    assert.equal(incremented.summary.receipts[0]?.status, 1)
+
+    const canonicalBalance = await chain.getAccountBalance(SENDER_ADDRESS)
+    const canonicalCode = await chain.getCode(contractAddress)
+    const checkpointPath = join(directory, 'checkpoint')
+
+    const manifest = await chain.exportStateCheckpoint(checkpointPath)
+    assert.equal(manifest.profileId, LOCAL_CHAIN_PROFILE)
+    assert.equal(manifest.blockHeight, '2')
+    assert.equal(manifest.blockHash, incremented.summary.hash)
+    assert.equal(manifest.stateRoot, incremented.summary.stateRoot)
+
+    const canonicalView = await chain.createCanonicalReadView()
+    const recovered = await recoverStateCheckpoint(
+      checkpointPath,
+      canonicalView,
+      LOCAL_CHAIN_PROFILE,
+    )
+
+    try {
+      assert.equal(recovered.manifest.stateRoot, incremented.summary.stateRoot)
+      assert.equal(
+        bytesToBigInt(
+          await recovered.stateManager.getStorage(contractAddress, new Uint8Array(32)),
+        ),
+        1n,
+      )
+      assert.deepEqual(
+        new Uint8Array(await recovered.stateManager.getCode(contractAddress)),
+        new Uint8Array(canonicalCode),
+      )
+      assert.equal(
+        (await recovered.stateManager.getAccount(SENDER_ADDRESS))?.balance,
+        canonicalBalance,
+      )
+      assert.equal(
+        bytesToHex(await recovered.stateManager.getStateRoot()),
+        incremented.summary.stateRoot,
+      )
+    } finally {
+      await recovered.close()
+    }
   })
 })
 
