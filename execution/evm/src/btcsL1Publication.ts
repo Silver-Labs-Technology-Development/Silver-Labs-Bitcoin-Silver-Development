@@ -40,7 +40,7 @@ function validateNonNegativeInteger(value: unknown, label: string): asserts valu
   }
 }
 
-function validateRecord(value: BtcsL1PublicationRecord): void {
+export function validateBtcsL1PublicationRecord(value: unknown): BtcsL1PublicationRecord {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new ProtocolError('publication record must be an object')
   }
@@ -112,6 +112,7 @@ function validateRecord(value: BtcsL1PublicationRecord): void {
       }
       break
   }
+  return value as BtcsL1PublicationRecord
 }
 
 export function createBtcsL1Publication(
@@ -136,7 +137,7 @@ export function markBtcsL1PublicationSubmitted(
   record: BtcsL1PublicationRecord,
   txid: string,
 ): BtcsL1PublicationRecord {
-  validateRecord(record)
+  validateBtcsL1PublicationRecord(record)
   if (record.state !== 'prepared') {
     throw new ProtocolError('only a prepared publication can be submitted')
   }
@@ -151,7 +152,7 @@ export function observeBtcsL1Publication(
   blockHeight: number,
   confirmations: number,
 ): BtcsL1PublicationRecord {
-  validateRecord(record)
+  validateBtcsL1PublicationRecord(record)
   if (
     record.state !== 'submitted' &&
     record.state !== 'observed' &&
@@ -193,7 +194,7 @@ export function observeBtcsL1Publication(
     blockHeight,
     confirmations,
   }
-  validateRecord(next)
+  validateBtcsL1PublicationRecord(next)
   return next
 }
 
@@ -203,7 +204,7 @@ export function reobserveBtcsL1Publication(
   blockHeight: number,
   confirmations: number,
 ): BtcsL1PublicationRecord {
-  validateRecord(record)
+  validateBtcsL1PublicationRecord(record)
   if (record.state !== 'invalidated') {
     throw new ProtocolError('only an invalidated publication can be re-observed')
   }
@@ -222,20 +223,20 @@ export function reobserveBtcsL1Publication(
     blockHeight,
     confirmations,
   }
-  validateRecord(next)
+  validateBtcsL1PublicationRecord(next)
   return next
 }
 
 export function invalidateBtcsL1Publication(
   record: BtcsL1PublicationRecord,
 ): BtcsL1PublicationRecord {
-  validateRecord(record)
+  validateBtcsL1PublicationRecord(record)
   if (record.state !== 'observed' && record.state !== 'confirmed') {
     throw new ProtocolError('only an observed or confirmed publication can be invalidated')
   }
 
   const { blockHash: _blockHash, blockHeight: _blockHeight, confirmations: _confirmations, ...base } = record
   const next: BtcsL1PublicationRecord = { ...base, state: 'invalidated' }
-  validateRecord(next)
+  validateBtcsL1PublicationRecord(next)
   return next
 }
