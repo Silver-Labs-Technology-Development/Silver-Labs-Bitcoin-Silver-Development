@@ -81,6 +81,7 @@ export async function verifyEvmSettlementBatchExecution(
 
       const processed = await processor.acceptBlock(
         hexToBytes(envelope.blockRlpHex as `0x${string}`),
+        envelope.depositOperations,
       )
       if (processed.blockRlpHex !== envelope.blockRlpHex) {
         throw new ProtocolError(`re-executed block ${envelope.height} bytes do not match`)
@@ -173,6 +174,7 @@ export async function verifyEvmSettlementBatchExecutionFromCheckpoint(
       recovered.stateManager,
       recovered.manifest,
       batch.envelopes.map((envelope) => envelope.blockRlpHex),
+      batch.envelopes.map((envelope) => envelope.depositOperations),
     )
 
     if (replay.blocks.length !== batch.envelopes.length) {

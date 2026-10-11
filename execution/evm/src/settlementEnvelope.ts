@@ -7,9 +7,14 @@ import {
   MAX_SERIALIZED_BLOCK_BYTES,
   ProtocolError,
 } from './blockProcessor.js'
+import {
+  calculateEvmDepositPreludeCommitment,
+  verifyEvmDepositPrelude,
+  type EvmDepositOperation,
+} from './depositPrelude.js'
 
 export const EVM_SETTLEMENT_FORMAT = 'btcs-l2-evm-settlement'
-export const EVM_SETTLEMENT_VERSION = 'v1'
+export const EVM_SETTLEMENT_VERSION = 'v2'
 export const ZERO_COMMITMENT = '0'.repeat(64)
 
 export type EvmSettlementEnvelope = Readonly<{
@@ -25,6 +30,7 @@ export type EvmSettlementEnvelope = Readonly<{
   stateRoot: string
   transactionsRoot: string
   receiptsRoot: string
+  depositOperations: readonly EvmDepositOperation[]
   previousCommitment: string
   commitmentHash: string
 }>
@@ -32,7 +38,8 @@ export type EvmSettlementEnvelope = Readonly<{
 const ENVELOPE_KEYS = [
   'format', 'version', 'chainId', 'profileId', 'hardfork', 'height',
   'blockRlpHex', 'blockHash', 'parentHash', 'stateRoot',
-  'transactionsRoot', 'receiptsRoot', 'previousCommitment', 'commitmentHash',
+  'transactionsRoot', 'receiptsRoot', 'depositOperations',
+  'previousCommitment', 'commitmentHash',
 ] as const
 
 const HASH_RE = /^0x[0-9a-f]{64}$/
@@ -47,7 +54,7 @@ function canonicalFields(
   envelope: Omit<EvmSettlementEnvelope, 'commitmentHash'>,
 ): string {
   return [
-    'BTCSL2-EVM-SETTLEMENT|v1',
+    'BTCSL2-EVM-SETTLEMENT|v2',
     `chain_id=${envelope.chainId}`,
     `profile_id=${envelope.profileId}`,
     `hardfork=${envelope.hardfork}`,
@@ -58,6 +65,7 @@ function canonicalFields(
     `state_root=${envelope.stateRoot}`,
     `transactions_root=${envelope.transactionsRoot}`,
     `receipts_root=${envelope.receiptsRoot}`,
+    `deposit_operations_commitment=${calculateEvmDepositPreludeCommitment(envelope.depositOperations) ?? 'none'}`,
     `previous_commitment=${envelope.previousCommitment}`,
   ].join('\n')
 }
@@ -97,6 +105,7 @@ function parseCanonicalBlock(blockRlpHex: string) {
 function deriveEnvelopeFields(
   blockRlpHex: string,
   previousCommitment: string,
+  depositOperations: unknown = [],
 ): Omit<EvmSettlementEnvelope, 'commitmentHash'> {
   if (!COMMITMENT_RE.test(previousCommitment)) {
     throw new ProtocolError('previous commitment must be 64 lowercase hex characters')
@@ -104,6 +113,10 @@ function deriveEnvelopeFields(
 
   const block = parseCanonicalBlock(blockRlpHex)
   const header = block.header
+  const verifiedDepositOperations = verifyEvmDepositPrelude(
+    depositOperations,
+    header.extraData,
+  )
   return {
     format: EVM_SETTLEMENT_FORMAT,
     version: EVM_SETTLEMENT_VERSION,
@@ -117,6 +130,7 @@ function deriveEnvelopeFields(
     stateRoot: bytesToHex(header.stateRoot),
     transactionsRoot: bytesToHex(header.transactionsTrie),
     receiptsRoot: bytesToHex(header.receiptTrie),
+    depositOperations: verifiedDepositOperations,
     previousCommitment,
   }
 }
@@ -124,8 +138,13 @@ function deriveEnvelopeFields(
 export function createEvmSettlementEnvelope(
   blockRlpHex: string,
   previousCommitment = ZERO_COMMITMENT,
+  depositOperations: readonly EvmDepositOperation[] = [],
 ): EvmSettlementEnvelope {
-  const fields = deriveEnvelopeFields(blockRlpHex, previousCommitment)
+  const fields = deriveEnvelopeFields(
+    blockRlpHex,
+    previousCommitment,
+    depositOperations,
+  )
   return { ...fields, commitmentHash: calculateCommitment(fields) }
 }
 
@@ -159,6 +178,7 @@ export function verifyEvmSettlementEnvelope(
   }
 
   for (const key of ENVELOPE_KEYS) {
+    if (key === 'depositOperations') continue
     if (typeof record[key] !== 'string') {
       throw new ProtocolError(`settlement envelope field ${key} must be a string`)
     }
@@ -202,6 +222,7 @@ export function verifyEvmSettlementEnvelope(
   const derived = deriveEnvelopeFields(
     envelope.blockRlpHex,
     envelope.previousCommitment,
+    record.depositOperations,
   )
   for (const key of [
     'height', 'blockHash', 'parentHash', 'stateRoot', 'transactionsRoot', 'receiptsRoot',
@@ -216,5 +237,8 @@ export function verifyEvmSettlementEnvelope(
   if (calculateCommitment(derived) !== envelope.commitmentHash) {
     throw new ProtocolError('settlement commitment hash mismatch')
   }
-  return envelope
+  return {
+    ...envelope,
+    depositOperations: derived.depositOperations,
+  }
 }

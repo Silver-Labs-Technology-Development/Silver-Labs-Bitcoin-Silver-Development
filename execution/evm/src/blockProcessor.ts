@@ -32,10 +32,16 @@ import {
   SENDER_ADDRESS,
   createHarnessCommon,
 } from './config.js'
+import {
+  encodeEvmDepositPreludeExtraData,
+  normalizeEvmDepositOperations,
+  verifyEvmDepositPrelude,
+  type EvmDepositOperation,
+} from './depositPrelude.js'
 
-export const LOCAL_CHAIN_PROFILE = 'btcs-l2-local-v0.11-osaka'
-export const STORE_SCHEMA_VERSION = 1
-export const PROTOCOL_VERSION = '0.11-draft.1'
+export const LOCAL_CHAIN_PROFILE = 'btcs-l2-local-v0.12-deposit-prelude'
+export const STORE_SCHEMA_VERSION = 2
+export const PROTOCOL_VERSION = '0.12-draft.1'
 export const BLOCK_GAS_LIMIT = 30_000_000n
 export const GENESIS_TIMESTAMP = 1_749_999_999n
 export const GENESIS_BASE_FEE = 1_000_000_000n
@@ -44,6 +50,7 @@ export const MAX_BLOCK_RECORD_BYTES = 67_108_864
 export const MAX_TRANSACTIONS_PER_BLOCK = 4_096
 
 const MAX_U64 = (1n << 64n) - 1n
+const MAX_EVM_BALANCE = (1n << 256n) - 1n
 const MAX_BLOCK_NUMBER = BigInt(Number.MAX_SAFE_INTEGER)
 const ZERO32 = new Uint8Array(32)
 const ZERO8 = new Uint8Array(8)
@@ -149,6 +156,7 @@ type BlockRecord = {
   blockRlpHex: string
   receiptRlpHexes: string[]
   outcomes: TransactionOutcome[]
+  depositOperations: EvmDepositOperation[]
 }
 
 type ChainMetadata = {
@@ -197,6 +205,41 @@ export class CanonicalReadView {
     const summary = this.session.report.blocks[index]
     if (block === undefined || summary === undefined) return undefined
     return { blockRlpHex: asBytesHex(block.serialize()), summary }
+  }
+
+  /** Return the committed deposit operations for one canonical block. */
+  getCanonicalDepositOperations(blockNumber: bigint): readonly EvmDepositOperation[] {
+    if (blockNumber < 0n || blockNumber > this.session.report.tip.number) {
+      throw new ProtocolError('deposit-operation block number is outside canonical history')
+    }
+    const item = this.session.records[Number(blockNumber)]
+    if (item === undefined) {
+      throw new ProtocolError('canonical deposit-operation record is missing')
+    }
+    return item.record.depositOperations.map((operation) => ({ ...operation }))
+  }
+
+  /**
+   * Return operations from genesis through a selected canonical height.
+   * Checkpoint continuation uses this to prevent re-crediting older deposits.
+   */
+  getCanonicalDepositOperationsThroughHeight(
+    blockNumber: bigint,
+  ): readonly EvmDepositOperation[] {
+    if (blockNumber < 0n || blockNumber > this.session.report.tip.number) {
+      throw new ProtocolError('deposit-operation height is outside canonical history')
+    }
+    const operations: EvmDepositOperation[] = []
+    for (let height = 0n; height <= blockNumber; height += 1n) {
+      const item = this.session.records[Number(height)]
+      if (item === undefined) {
+        throw new ProtocolError('canonical deposit-operation history has a gap')
+      }
+      operations.push(
+        ...item.record.depositOperations.map((operation) => ({ ...operation })),
+      )
+    }
+    return operations
   }
 
   getCanonicalBlockByHash(blockHash: string): CanonicalBlockData | undefined {
@@ -406,6 +449,7 @@ function recordFromBlock(
   block: Block,
   receiptRlpHexes: string[],
   outcomes: TransactionOutcome[],
+  depositOperations: readonly EvmDepositOperation[] = [],
 ): BlockRecord {
   return {
     format: 'btcs-l2-block-record',
@@ -415,6 +459,54 @@ function recordFromBlock(
     blockRlpHex: asBytesHex(block.serialize()),
     receiptRlpHexes,
     outcomes,
+    depositOperations: [...depositOperations],
+  }
+}
+
+function collectCommittedDepositIds(records: readonly BlockRecord[]): Set<string> {
+  const seen = new Set<string>()
+  for (const record of records) {
+    for (const operation of record.depositOperations) {
+      if (seen.has(operation.depositId)) {
+        throw new ProtocolError('canonical history contains a duplicate deposit credit')
+      }
+      seen.add(operation.depositId)
+    }
+  }
+  return seen
+}
+
+function registerFreshDepositOperations(
+  operations: readonly EvmDepositOperation[],
+  seen: Set<string>,
+): void {
+  for (const operation of operations) {
+    if (seen.has(operation.depositId)) {
+      throw new ProtocolError(
+        `deposit ${operation.depositId} was already included in canonical history`,
+      )
+    }
+  }
+  for (const operation of operations) seen.add(operation.depositId)
+}
+
+async function applyEvmDepositOperations(
+  vm: Awaited<ReturnType<typeof createVM>>,
+  operations: readonly EvmDepositOperation[],
+): Promise<void> {
+  for (const operation of operations) {
+    const address = new Address(
+      unprefixedHexToBytes(operation.recipientAddress.slice(2)),
+    )
+    const account = await vm.stateManager.getAccount(address) ?? new Account()
+    const nextBalance = account.balance + BigInt(operation.amountWei)
+
+    if (nextBalance > MAX_EVM_BALANCE) {
+      throw new ProtocolError('deposit credit would overflow the EVM account balance')
+    }
+
+    account.balance = nextBalance
+    await vm.stateManager.putAccount(address, account)
   }
 }
 
@@ -686,7 +778,7 @@ function validateChildHeader(
     header.difficulty !== 0n ||
     !sameHex(header.mixHash, ZERO32) ||
     !sameHex(header.nonce, ZERO8) ||
-    header.extraData.length !== 0
+    (header.extraData.length !== 0 && header.extraData.length !== 32)
   ) {
     throw new ProtocolError('block contains a noncanonical local consensus/context field')
   }
@@ -730,6 +822,7 @@ function verifyBlockRecordShape(value: unknown, expectedHash: string): BlockReco
     'blockRlpHex',
     'receiptRlpHexes',
     'outcomes',
+    'depositOperations',
   ]
   if (!compareJson(Object.keys(candidate).sort(), expectedKeys.sort())) {
     throw new ProtocolError('block record has missing or unsupported fields')
@@ -749,13 +842,21 @@ function verifyBlockRecordShape(value: unknown, expectedHash: string): BlockReco
   ) {
     throw new ProtocolError('block record exceeds the transaction sidecar count limit')
   }
+  if (!Array.isArray(candidate.depositOperations)) {
+    throw new ProtocolError('block record deposit operations must be an array')
+  }
   for (const receiptHex of candidate.receiptRlpHexes) lowerHex(receiptHex, 'receipt RLP')
   for (const outcome of candidate.outcomes) {
     if (typeof outcome !== 'object' || outcome === null || Array.isArray(outcome)) {
       throw new ProtocolError('transaction outcome must be a JSON object')
     }
   }
-  return candidate as BlockRecord
+  return {
+    ...(candidate as unknown as BlockRecord),
+    depositOperations: [
+      ...normalizeEvmDepositOperations(candidate.depositOperations),
+    ],
+  }
 }
 
 function verifyMetadata(value: unknown): ChainMetadata {
@@ -1067,12 +1168,20 @@ export class PersistentBlockProcessor {
   async buildNextBlock(
     transactions: readonly TypedTransaction[],
     timestamp: bigint,
+    depositOperations: readonly EvmDepositOperation[] = [],
   ): Promise<ProcessedBlock> {
     const orderedTransactionBytes = snapshotTransactionBytes(transactions)
+    const canonicalDepositOperations = [
+      ...normalizeEvmDepositOperations(depositOperations),
+    ]
     return this.withExclusiveOperation(async () => {
       const session = await this.replayCanonical()
       const parent = session.blocks.at(-1)
       if (parent === undefined) throw new ProtocolError('canonical chain is missing genesis')
+      const seenDepositIds = collectCommittedDepositIds(
+        session.records.map(({ record }) => record),
+      )
+      registerFreshDepositOperations(canonicalDepositOperations, seenDepositIds)
       if (timestamp <= parent.header.timestamp || timestamp > MAX_U64) {
         throw new ProtocolError('timestamp must be greater than the parent and fit uint64')
       }
@@ -1092,7 +1201,7 @@ export class PersistentBlockProcessor {
           difficulty: 0n,
           mixHash: ZERO32,
           nonce: ZERO8,
-          extraData: new Uint8Array(),
+          extraData: encodeEvmDepositPreludeExtraData(canonicalDepositOperations),
           parentBeaconBlockRoot: ZERO32,
         },
         withdrawals: [],
@@ -1102,9 +1211,15 @@ export class PersistentBlockProcessor {
         },
       })
       try {
+        // Deposit credits enter state after builder initialisation but before
+        // ordinary transactions, and are committed by the block state root.
+        await applyEvmDepositOperations(session.vm, canonicalDepositOperations)
         for (const { tx } of canonicalTransactions) await builder.addTransaction(tx)
         const { block } = await builder.build()
-        return await this.appendBlockUnlocked(block.serialize())
+        return await this.appendBlockUnlocked(
+          block.serialize(),
+          canonicalDepositOperations,
+        )
       } catch (error) {
         await builder.revert().catch(() => undefined)
         if (error instanceof ProtocolError) throw error
@@ -1113,8 +1228,16 @@ export class PersistentBlockProcessor {
     })
   }
 
-  async acceptBlock(blockRlp: Uint8Array): Promise<ProcessedBlock> {
-    return this.withExclusiveOperation(() => this.appendBlockUnlocked(new Uint8Array(blockRlp)))
+  async acceptBlock(
+    blockRlp: Uint8Array,
+    depositOperations: readonly EvmDepositOperation[] = [],
+  ): Promise<ProcessedBlock> {
+    return this.withExclusiveOperation(() =>
+      this.appendBlockUnlocked(
+        new Uint8Array(blockRlp),
+        depositOperations,
+      ),
+    )
   }
 
   async replay(): Promise<ReplayReport> {
@@ -1212,7 +1335,10 @@ export class PersistentBlockProcessor {
     return (await this.createCanonicalReadView()).getCanonicalReceiptByTransactionHash(transactionHash)
   }
 
-  private async appendBlockUnlocked(rawBlock: Uint8Array): Promise<ProcessedBlock> {
+  private async appendBlockUnlocked(
+    rawBlock: Uint8Array,
+    depositOperations: readonly EvmDepositOperation[] = [],
+  ): Promise<ProcessedBlock> {
     if (rawBlock.length === 0 || rawBlock.length > MAX_SERIALIZED_BLOCK_BYTES) {
       throw new ProtocolError('serialized block is empty or exceeds the local parser limit')
     }
@@ -1233,6 +1359,14 @@ export class PersistentBlockProcessor {
       throw new ProtocolError('block exceeds the transaction parser count limit')
     }
     validateChildHeader(block, parent, session.common)
+    const verifiedDepositOperations = verifyEvmDepositPrelude(
+      depositOperations,
+      block.header.extraData,
+    )
+    const seenDepositIds = collectCommittedDepositIds(
+      session.records.map(({ record }) => record),
+    )
+    registerFreshDepositOperations(verifiedDepositOperations, seenDepositIds)
     canonicalizeTransactionBytes(
       block.transactions.map((tx) => new Uint8Array(tx.serialize())),
       session.common,
@@ -1241,6 +1375,7 @@ export class PersistentBlockProcessor {
 
     let result: RunBlockResult
     try {
+      await applyEvmDepositOperations(session.vm, verifiedDepositOperations)
       result = await runBlock(session.vm, {
         block,
         skipHeaderValidation: true,
@@ -1258,7 +1393,12 @@ export class PersistentBlockProcessor {
       if (transaction === undefined) throw new ProtocolError('receipt has no corresponding transaction')
       return asBytesHex(encodeReceipt(receipt, transaction.type))
     })
-    const record = recordFromBlock(block, receiptRlpHexes, outcomes)
+    const record = recordFromBlock(
+      block,
+      receiptRlpHexes,
+      outcomes,
+      verifiedDepositOperations,
+    )
     const encodedRecord = encodeJson(record)
     if (encodedRecord.length > MAX_BLOCK_RECORD_BYTES) {
       throw new ProtocolError('complete block record exceeds the local persistence limit')
@@ -1394,18 +1534,25 @@ export class PersistentBlockProcessor {
     if (
       storedGenesis.receiptRlpHexes.length !== 0 ||
       storedGenesis.outcomes.length !== 0 ||
+      storedGenesis.depositOperations.length !== 0 ||
       storedGenesis.blockRlpHex !== asBytesHex(genesisSession.genesis.serialize())
     ) {
       throw new ProtocolError('genesis persistence record differs from the fixed genesis')
     }
 
     const summaries: BlockSummary[] = [blockSummary(genesisSession.genesis, [])]
+    const seenDepositIds = new Set<string>()
     let parent = genesisSession.genesis
     for (let index = 1; index < records.length; index++) {
       const item = records[index]
       if (item === undefined) throw new ProtocolError('canonical block sequence has a gap')
       const { block, record } = item
       validateChildHeader(block, parent, genesisSession.common)
+      const verifiedDepositOperations = verifyEvmDepositPrelude(
+        record.depositOperations,
+        block.header.extraData,
+      )
+      registerFreshDepositOperations(verifiedDepositOperations, seenDepositIds)
       canonicalizeTransactionBytes(
         block.transactions.map((tx) => new Uint8Array(tx.serialize())),
         genesisSession.common,
@@ -1413,6 +1560,10 @@ export class PersistentBlockProcessor {
       )
       let result: RunBlockResult
       try {
+        await applyEvmDepositOperations(
+          genesisSession.vm,
+          verifiedDepositOperations,
+        )
         result = await runBlock(genesisSession.vm, {
           block,
           skipHeaderValidation: true,
@@ -1481,12 +1632,21 @@ export async function reexecuteFromVerifiedCheckpoint(
     'profileId' | 'blockHeight' | 'blockHash' | 'stateRoot'
   >,
   childBlockRlpHexes: readonly string[],
+  childDepositOperations: readonly (readonly EvmDepositOperation[])[] = [],
 ): Promise<CheckpointContinuationReplay> {
   if (checkpoint.profileId !== LOCAL_CHAIN_PROFILE) {
     throw new ProtocolError('checkpoint continuation uses the wrong execution profile')
   }
   if (childBlockRlpHexes.length === 0) {
     throw new ProtocolError('checkpoint continuation must contain at least one child block')
+  }
+  if (
+    childDepositOperations.length !== 0 &&
+    childDepositOperations.length !== childBlockRlpHexes.length
+  ) {
+    throw new ProtocolError(
+      'checkpoint continuation deposit-operation count does not match its blocks',
+    )
   }
 
   const checkpointHeight = parseCanonicalUint(
@@ -1584,10 +1744,17 @@ export async function reexecuteFromVerifiedCheckpoint(
     throw new ProtocolError('checkpoint block was not loaded into the execution ancestry')
   }
 
+  const seenDepositIds = new Set(
+    canonicalView
+      .getCanonicalDepositOperationsThroughHeight(checkpointHeight)
+      .map((operation) => operation.depositId),
+  )
   const reexecuted: ProcessedBlock[] = []
   parent = checkpointBlock
 
-  for (const blockRlpHex of childBlockRlpHexes) {
+  for (let childIndex = 0; childIndex < childBlockRlpHexes.length; childIndex += 1) {
+    const blockRlpHex = childBlockRlpHexes[childIndex]!
+    const candidateDepositOperations = childDepositOperations[childIndex] ?? []
     let block: Block
     try {
       block = createBlockFromRLP(
@@ -1604,6 +1771,11 @@ export async function reexecuteFromVerifiedCheckpoint(
       throw new ProtocolError('continuation block RLP is not canonical')
     }
     validateChildHeader(block, parent, common)
+    const verifiedDepositOperations = verifyEvmDepositPrelude(
+      candidateDepositOperations,
+      block.header.extraData,
+    )
+    registerFreshDepositOperations(verifiedDepositOperations, seenDepositIds)
     canonicalizeTransactionBytes(
       block.transactions.map((tx) => new Uint8Array(tx.serialize())),
       common,
@@ -1612,6 +1784,7 @@ export async function reexecuteFromVerifiedCheckpoint(
 
     let result: RunBlockResult
     try {
+      await applyEvmDepositOperations(vm, verifiedDepositOperations)
       result = await runBlock(vm, {
         block,
         skipHeaderValidation: true,

@@ -6,7 +6,7 @@ import {
 import { ProtocolError } from './blockProcessor.js'
 
 export const EVM_SETTLEMENT_BATCH_FORMAT = 'btcs-l2-evm-settlement-batch'
-export const EVM_SETTLEMENT_BATCH_VERSION = 'v1'
+export const EVM_SETTLEMENT_BATCH_VERSION = 'v2'
 export const MAX_BATCH_BLOCKS = 1024
 
 export type EvmSettlementBatch = Readonly<{
@@ -45,7 +45,7 @@ function hashBatchFields(
 ): string {
   // Each envelope commitment binds its canonical block RLP and header fields.
   const canonical = [
-    'BTCSL2-EVM-SETTLEMENT-BATCH|v1',
+    'BTCSL2-EVM-SETTLEMENT-BATCH|v2',
     `format=${batch.format}`,
     `version=${batch.version}`,
     `chain_id=${batch.chainId}`,
@@ -82,6 +82,7 @@ function checkEnvelopeSequence(
   let parentHash = expectedParentHash
   let previousHeight: bigint | undefined
   const verified: EvmSettlementEnvelope[] = []
+  const seenDepositIds = new Set<string>()
 
   for (const candidate of envelopes) {
     const envelope = verifyEvmSettlementEnvelope(
@@ -89,6 +90,15 @@ function checkEnvelopeSequence(
       previousCommitment,
       parentHash,
     )
+    for (const operation of envelope.depositOperations) {
+      if (seenDepositIds.has(operation.depositId)) {
+        throw new ProtocolError(
+          `settlement batch repeats deposit claim ${operation.depositId}`,
+        )
+      }
+      seenDepositIds.add(operation.depositId)
+    }
+
     const height = BigInt(envelope.height)
 
     if (previousHeight !== undefined && height !== previousHeight + 1n) {

@@ -15,6 +15,7 @@ import {
   GENESIS_TIMESTAMP,
   MAX_SERIALIZED_BLOCK_BYTES,
   MAX_TRANSACTIONS_PER_BLOCK,
+  STORE_SCHEMA_VERSION,
   LOCAL_CHAIN_PROFILE,
   PersistentBlockProcessor,
   ProtocolError,
@@ -501,7 +502,7 @@ test('content-addressed records and canonical tip metadata contain the accepted 
       canonicalTipHash: string
       schemaVersion: number
     }
-    assert.equal(metadata.schemaVersion, 1)
+    assert.equal(metadata.schemaVersion, STORE_SCHEMA_VERSION)
     assert.equal(metadata.canonicalHeight, '1')
     assert.equal(metadata.canonicalTipHash, accepted.summary.hash)
     assert.equal(chain.tip.hash, accepted.summary.hash)
@@ -689,7 +690,7 @@ test('metadata parsing is bounded, schema-pinned, and never repaired on failure'
       mutate: async (directory) => {
         const path = join(directory, 'chain.json')
         const metadata = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
-        metadata.schemaVersion = 2
+        metadata.schemaVersion = STORE_SCHEMA_VERSION + 1
         await writeFile(path, `${JSON.stringify(metadata)}\n`)
       },
       error: /schemaVersion/,
@@ -713,7 +714,7 @@ test('unsupported block record schema versions are rejected without rewriting hi
     const accepted = await chain.buildNextBlock([tx], GENESIS_TIMESTAMP + 1n)
     const recordPath = join(directory, 'blocks', `${accepted.summary.hash.slice(2)}.json`)
     const record = await readStoredRecord(directory, accepted.summary.hash)
-    record.schemaVersion = 2
+    record.schemaVersion = STORE_SCHEMA_VERSION + 1
     await writeStoredRecord(directory, accepted.summary.hash, record)
     await assertRejectedWithoutChanging(directory, [recordPath], /format, schema, or content address/)
   })
