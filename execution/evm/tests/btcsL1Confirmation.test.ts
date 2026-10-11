@@ -25,6 +25,7 @@ function makeRpc(options: {
   headerHash?: string
   height?: number
   confirmations?: number
+  txConfirmations?: number
 } = {}): BtcsL1ConfirmationRpc {
   return {
     async getRawTransaction() {
@@ -32,6 +33,7 @@ function makeRpc(options: {
         txid: options.txid ?? txid,
         blockhash: options.blockhash ?? blockHash,
         in_active_chain: options.inActiveChain ?? true,
+        confirmations: options.txConfirmations ?? 10,
         vout: (options.scripts ?? [encodeBtcsL1AnchorScript(batchHash)]).map(
           (hex) => ({ scriptPubKey: { hex } }),
         ),
@@ -123,6 +125,35 @@ test('rejects insufficient confirmations and mismatched block headers', async ()
   await assert.rejects(
     verifyBtcsL1AnchorConfirmation(makeRpc({ headerHash: '6'.repeat(64) }), request),
     /different block hash/,
+  )
+})
+
+test('rejects missing, invalid, or inconsistent transaction confirmations', async () => {
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(
+      {
+        ...makeRpc(),
+        async getRawTransaction() {
+          return {
+            txid,
+            blockhash: blockHash,
+            in_active_chain: true,
+            vout: [{ scriptPubKey: { hex: encodeBtcsL1AnchorScript(batchHash) } }],
+          }
+        },
+      },
+      request,
+    ),
+    /invalid confirmation count/,
+  )
+
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(makeRpc({ txConfirmations: 0 }), request),
+    /confirmation counts disagree/,
+  )
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(makeRpc({ txConfirmations: 9 }), request),
+    /confirmation counts disagree/,
   )
 })
 

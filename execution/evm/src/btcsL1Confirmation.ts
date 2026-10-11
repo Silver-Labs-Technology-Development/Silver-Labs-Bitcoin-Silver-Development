@@ -119,6 +119,16 @@ export async function verifyBtcsL1AnchorConfirmation(
     throw new ProtocolError('BTCS L1 anchor has insufficient confirmations')
   }
 
+  if (
+    !Number.isSafeInteger(tx.confirmations) ||
+    (tx.confirmations as number) < 0
+  ) {
+    throw new ProtocolError('transaction has an invalid confirmation count')
+  }
+  if (tx.confirmations !== header.confirmations) {
+    throw new ProtocolError('transaction and block header confirmation counts disagree')
+  }
+
   return {
     format: 'btcs-l2-btcs-l1-confirmation',
     version: 1,
