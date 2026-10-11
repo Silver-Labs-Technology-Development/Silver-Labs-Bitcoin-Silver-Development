@@ -22,9 +22,12 @@ npm run typecheck
 npm run compile:contracts
 npm test
 npm run demo
+npm run demo:client
 ```
 
 `npm run compile:contracts` compiles `contracts/Counter.sol` and writes `artifacts/Counter.json`. Tests compile the same pinned Solidity source in memory, execute signed EIP-1559 transactions, and compare transaction roots, state roots, receipts, gas, and logs across fresh runs.
+
+`npm run demo:client` runs the one-command local client demonstration described in [One-command client demo](#one-command-client-demo) and prints a single JSON summary. Run `npm run --silent demo:client` to put only that JSON on stdout.
 
 ## v0.11 local block processor
 
@@ -127,6 +130,50 @@ transactions exist only in process memory and are lost on restart. No key is
 stored and nothing is broadcast. Without `--dev-sequencer`, both methods return
 method-not-found. `eth_call`, full Ethereum JSON-RPC compatibility,
 authentication, remote access, and production availability are not provided.
+
+<a id="one-command-client-demo"></a>
+
+## One-command client demo (`demo:client`)
+
+`npm run demo:client` is a self-contained, reproducible client-facing
+demonstration. On a fresh temporary data directory it starts the local chain and
+the loopback RPC (`src/rpc.ts`), deploys `contracts/Counter.sol` with a signed
+type-2 transaction, calls `increment()`, calls `incrementThenRevert()` (a
+reverted transaction), and makes a signed value transfer. It then mines one
+block with `btcs_dev_mine` and reads code, storage, balances, receipts, nonces,
+and logs back through the JSON-RPC methods, builds a genesis-starting settlement
+batch from the canonical block RLP, verifies it with
+`verifyEvmSettlementBatchExecution`, writes the batch file, and prints one
+machine-readable JSON summary. Any failed assertion exits nonzero with a message
+on stderr.
+
+```sh
+npm run demo:client
+npm run --silent demo:client   # only the JSON summary on stdout
+npm run demo:client -- --datadir /tmp/btcs-l2-client-demo --batch-out /tmp/btcs-l2-client-demo/batch.json
+```
+
+`--datadir <path>` uses a persistent data directory instead of a temporary one
+(the temporary directory is removed on exit). `--batch-out <path>` chooses where
+the settlement batch file is written. Without `--batch-out`, the batch file is
+written to a fresh artifact directory that is kept after exit, so the summary's
+`batchFilePath` always names an existing file; remove that directory yourself
+when you no longer need the artifact. The summary's `settlement.batchHash` equals
+the batch hash reported by the standalone verifier:
+
+```sh
+npm run verify:batch:execution -- <batch-file> 0000000000000000000000000000000000000000000000000000000000000000 0x0000000000000000000000000000000000000000000000000000000000000000 0
+```
+
+What this proves: a local BTCS L2 EVM chain runs with no BTCS Core node; a
+contract deploys and mutates state; signed transactions, receipts, logs, code,
+storage, and a transferred balance are visible through the RPC; a reverted
+transaction keeps status `0` with rolled-back storage and logs while its nonce
+and gas effects remain; and the independent settlement replay accepts the
+emitted batch file. What it does not prove: `eth_call`/`eth_estimateGas`,
+automatic mining, withdrawals or production balance semantics, remote RPC, any
+L1 publication, settlement, or finality, or any production sequencer, rollup,
+proof system, or BTCS settlement client.
 
 ## Fixed execution assumptions
 

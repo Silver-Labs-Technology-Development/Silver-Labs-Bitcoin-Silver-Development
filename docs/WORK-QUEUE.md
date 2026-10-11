@@ -7,7 +7,7 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 | Task ID | Task | Status | Deliverable | Next action |
 |---|---|---|---|---|
 | BTCS-L2-CLIENT-001 | Client integration, use cases, and communication | COMPLETE | docs/CLIENT-INTEGRATION-PLAN-v0.1.md | Reviewed and committed as 4d27324 |
-| BTCS-L2-CLIENT-002 | Reproducible local client demonstration | READY_FOR_AGENT | execution/evm/scripts/demo-client.ts and README | Implement the demo defined in plan section 6 |
+| BTCS-L2-CLIENT-002 | Reproducible local client demonstration | READY_FOR_REVIEW | execution/evm/scripts/demo-client.ts, execution/evm/tests/clientDemo.test.ts, execution/evm/README.md | Verified on Node v24.17.0: `npm run typecheck` passes; `npm test` 178/178; no-arg `npm run demo:client` exits 0 and leaves an existing batch file whose `settlement.batchHash` (`0d86d1db…491179`) matches `npm run verify:batch:execution` (PASSED) |
 
 ## Working rules
 

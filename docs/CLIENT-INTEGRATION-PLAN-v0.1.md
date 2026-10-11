@@ -188,6 +188,13 @@ Each journey states the path that exists **today**, where it breaks, and the
 target experience. Journeys are written for a wallet/application developer, not
 for the protocol engineer.
 
+**Concrete reproducible path.** `cd execution/evm && npm run demo:client`
+([`execution/evm/scripts/demo-client.ts`](../execution/evm/scripts/demo-client.ts),
+documented in [`execution/evm/README.md`](../execution/evm/README.md)) runs the
+read, transfer, contract, and reverted-call parts of these journeys end to end
+on one local chain and prints a single JSON summary. It does not cover deposits
+(2.2) or withdrawals (2.5), which need an L1 node and remain unimplemented.
+
 ### 2.1 Wallet connection
 
 **Today.** A wallet can be manually configured against
