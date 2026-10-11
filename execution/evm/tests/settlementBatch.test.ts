@@ -161,18 +161,45 @@ test('independent replay verifies a valid genesis-plus-child batch', async () =>
   })
 })
 
-test('independent replay rejects a batch that does not start at genesis', async () => {
+test('independent replay rejects a valid non-genesis continuation until checkpoint replay is supported', async () => {
   await withStore(async (directory) => {
-    const { batch } = await makeTwoBlockBatch(directory)
+    const processor = await PersistentBlockProcessor.open(directory)
+
+    const view0 = await processor.createCanonicalReadView()
+    const genesis = view0.getCanonicalBlockByNumber(0n)
+    assert.ok(genesis)
+    const envelope0 = createEvmSettlementEnvelope(genesis.blockRlpHex)
+
+    await processor.buildNextBlock([], 1_750_000_001n)
+    const view1 = await processor.createCanonicalReadView()
+    const block1 = view1.getCanonicalBlockByNumber(1n)
+    assert.ok(block1)
+    const envelope1 = createEvmSettlementEnvelope(
+      block1.blockRlpHex,
+      envelope0.commitmentHash,
+    )
+
+    await processor.buildNextBlock([], 1_750_000_002n)
+    const view2 = await processor.createCanonicalReadView()
+    const block2 = view2.getCanonicalBlockByNumber(2n)
+    assert.ok(block2)
+    const envelope2 = createEvmSettlementEnvelope(
+      block2.blockRlpHex,
+      envelope1.commitmentHash,
+    )
+
+    const continuationBatch = createEvmSettlementBatch([envelope1, envelope2])
+    assert.equal(continuationBatch.startHeight, '1')
+    assert.equal(continuationBatch.endHeight, '2')
 
     await assert.rejects(
       verifyEvmSettlementBatchExecution(
-        batch,
-        ZERO_COMMITMENT,
-        ZERO_HASH,
+        continuationBatch,
+        envelope0.commitmentHash,
+        envelope0.blockHash,
         '1',
       ),
-      /batch start height does not match the expected starting height/,
+      /independent replay currently requires a batch starting at genesis height 0/,
     )
   })
 })
