@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PersistentBlockProcessor } from '../src/blockProcessor.js'
@@ -6,12 +6,14 @@ import { createEvmSettlementEnvelope, ZERO_COMMITMENT } from '../src/settlementE
 import { createEvmSettlementBatch } from '../src/settlementBatch.js'
 import { prepareBtcsL1AnchorForBatch } from '../src/btcsL1AnchorPreparation.js'
 import { BtcsL1CoreRpcClient } from '../src/btcsL1CoreRpc.js'
-import { verifyBtcsL1AnchorConfirmation } from '../src/btcsL1Confirmation.js'
+import { BtcsL1PublicationStore } from '../src/btcsL1PublicationStore.js'
+import { verifyAndAdvanceBtcsL1PublicationInStore } from '../src/btcsL1PublicationWorkflow.js'
 
 const HOST = '127.0.0.1'
 const PORT = 29443
 const WALLET = 'btcs-l2-anchor-regtest'
 const DATADIR = join(homedir(), '.local', 'share', 'btcs-l2-regtest-core')
+const PUBLICATION_STORE_DIR = join(homedir(), '.local', 'share', 'btcs-l2-regtest-publications')
 const ZERO_HASH = `0x${'0'.repeat(64)}`
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -21,7 +23,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-async function prepareVerifiedAnchor() {
+async function prepareVerifiedAnchor(timestamp: bigint) {
   const directory = await mkdtemp(join(tmpdir(), 'btcs-l2-regtest-batch-'))
   try {
     const processor = await PersistentBlockProcessor.open(directory)
@@ -31,7 +33,7 @@ async function prepareVerifiedAnchor() {
 
     const envelope0 = createEvmSettlementEnvelope(genesis.blockRlpHex)
 
-    await processor.buildNextBlock([], 1_750_000_001n)
+    await processor.buildNextBlock([], timestamp)
     const view1 = await processor.createCanonicalReadView()
     const child = view1.getCanonicalBlockByNumber(1n)
     if (!child) throw new Error('L2 prototype child block is missing')
@@ -51,6 +53,17 @@ async function prepareVerifiedAnchor() {
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+}
+
+async function openOrCreatePublicationStore() {
+  try {
+    await lstat(PUBLICATION_STORE_DIR)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return BtcsL1PublicationStore.create(PUBLICATION_STORE_DIR)
+  }
+  // Existing but missing/corrupt store files must fail closed.
+  return BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
 }
 
 async function main() {
@@ -105,16 +118,31 @@ async function main() {
   }
 
   await rpc('getwalletinfo', [], true)
+  const publicationStore = await openOrCreatePublicationStore()
   console.log('PASS: connected to local BTCS regtest and test wallet')
+  console.log(`Publication store: ${PUBLICATION_STORE_DIR}`)
 
-  const preparation = await prepareVerifiedAnchor()
+  const preparation = await prepareVerifiedAnchor(
+    BigInt(Math.floor(Date.now() / 1000)),
+  )
   if (preparation.executionVerified !== true) {
     throw new Error('Safety stop: batch execution was not verified')
   }
+  const existingPublication = publicationStore.get(preparation.batchHash)
+  if (existingPublication !== undefined && existingPublication.state !== 'prepared') {
+    throw new Error(
+      `Publication already exists for this batch in state ${existingPublication.state}`,
+    )
+  }
+  if (existingPublication === undefined) {
+    await publicationStore.createPublication(preparation.batchHash, 1)
+  }
+
   console.log(
     `PASS: independently verified L2 batch ${preparation.batchHash} ` +
     `(heights ${preparation.startHeight}-${preparation.endHeight})`,
   )
+  console.log('PASS: prepared publication record is durable')
 
   const raw = await rpc('createrawtransaction', [
     [],
@@ -167,7 +195,9 @@ async function main() {
   if (typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid)) {
     throw new Error('Core returned an invalid transaction ID')
   }
+  await publicationStore.markSubmitted(preparation.batchHash, txid)
   console.log(`PASS: transaction accepted by local regtest mempool (${txid})`)
+  console.log('PASS: submitted state is persisted')
 
   const miningAddress = await rpc('getnewaddress', [], true)
   if (typeof miningAddress !== 'string') throw new Error('Core returned an invalid mining address')
@@ -183,12 +213,26 @@ async function main() {
     username,
     password,
   })
-  const report = await verifyBtcsL1AnchorConfirmation(confirmationRpc, {
-    txid,
+  const report = await verifyAndAdvanceBtcsL1PublicationInStore(
+    confirmationRpc,
+    publicationStore,
+    preparation.batchHash,
     blockHash,
-    batchHash: preparation.batchHash,
-    requiredConfirmations: 1,
-  })
+  )
+
+  const reopenedStore = await BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+  const recovered = reopenedStore.get(preparation.batchHash)
+  if (recovered === undefined) {
+    throw new Error('Publication was missing after reopening the store')
+  }
+  if (JSON.stringify(recovered) !== JSON.stringify(report)) {
+    throw new Error('Recovered publication differs from the verified persisted state')
+  }
+  if (recovered.state !== 'confirmed') {
+    throw new Error(`Expected confirmed state; recovered ${recovered.state}`)
+  }
+  console.log('PASS: confirmation verified and persisted')
+  console.log('PASS: confirmed publication recovered after store reopen')
 
   console.log('\n=== VERIFIED REGTEST ANCHOR ===')
   console.log(JSON.stringify({
@@ -202,7 +246,8 @@ async function main() {
       dataHex: preparation.dataHex,
       scriptPubKeyHex: preparation.scriptPubKeyHex,
     },
-    confirmation: report,
+    publication: report,
+    recoveredPublication: recovered,
   }, null, 2))
 }
 
