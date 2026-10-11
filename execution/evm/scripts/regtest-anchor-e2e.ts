@@ -1,19 +1,20 @@
 import { lstat, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { PersistentBlockProcessor } from '../src/blockProcessor.js'
 import { createEvmSettlementEnvelope, ZERO_COMMITMENT } from '../src/settlementEnvelope.js'
 import { createEvmSettlementBatch } from '../src/settlementBatch.js'
 import { prepareBtcsL1AnchorForBatch } from '../src/btcsL1AnchorPreparation.js'
 import { BtcsL1CoreRpcClient } from '../src/btcsL1CoreRpc.js'
 import { BtcsL1PublicationStore } from '../src/btcsL1PublicationStore.js'
-import { verifyAndAdvanceBtcsL1PublicationInStore } from '../src/btcsL1PublicationWorkflow.js'
+import { invalidateBtcsL1PublicationAfterConfirmedReorg, verifyAndAdvanceBtcsL1PublicationInStore } from '../src/btcsL1PublicationWorkflow.js'
 
 const HOST = '127.0.0.1'
-const PORT = 29443
-const WALLET = 'btcs-l2-anchor-regtest'
-const DATADIR = join(homedir(), '.local', 'share', 'btcs-l2-regtest-core')
-const PUBLICATION_STORE_DIR = join(homedir(), '.local', 'share', 'btcs-l2-regtest-publications')
+const PORT = Number(process.env.BTCS_L2_REGTEST_PORT ?? 29443)
+const WALLET = process.env.BTCS_L2_REGTEST_WALLET ?? 'btcs-l2-anchor-regtest'
+const DATADIR = process.env.BTCS_L2_REGTEST_DATADIR ?? join(homedir(), '.local', 'share', 'btcs-l2-regtest-core')
+const PUBLICATION_STORE_DIR = process.env.BTCS_L2_PUBLICATION_STORE_DIR ?? join(homedir(), '.local', 'share', 'btcs-l2-regtest-publications')
+const REORG_TEST = process.env.BTCS_L2_REGTEST_REORG_TEST === '1'
 const ZERO_HASH = `0x${'0'.repeat(64)}`
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -67,6 +68,15 @@ async function openOrCreatePublicationStore() {
 }
 
 async function main() {
+  if (REORG_TEST) {
+    const expectedDatadir = join(homedir(), '.local', 'share', 'btcs-l2-regtest-reorg-20261011')
+    const expectedStore = join(homedir(), '.local', 'share', 'btcs-l2-regtest-reorg-publications-20261011')
+    if (PORT !== 29444 || resolve(DATADIR) !== resolve(expectedDatadir) ||
+      resolve(PUBLICATION_STORE_DIR) !== resolve(expectedStore) || WALLET !== 'btcs-l2-reorg-test') {
+      throw new Error('Safety stop: reorg test must use port 29444, the disposable reorg datadir/store, and wallet btcs-l2-reorg-test')
+    }
+  }
+
   const cookiePath = join(DATADIR, 'regtest', '.cookie')
   const cookie = (await readFile(cookiePath, 'utf8')).trim()
   const separator = cookie.indexOf(':')
@@ -120,6 +130,8 @@ async function main() {
   await rpc('getwalletinfo', [], true)
   const publicationStore = await openOrCreatePublicationStore()
   console.log('PASS: connected to local BTCS regtest and test wallet')
+  console.log(`RPC port: ${PORT}; wallet: ${WALLET}`)
+  console.log(`Data directory: ${DATADIR}`)
   console.log(`Publication store: ${PUBLICATION_STORE_DIR}`)
 
   const preparation = await prepareVerifiedAnchor(
@@ -234,6 +246,113 @@ async function main() {
   console.log('PASS: confirmation verified and persisted')
   console.log('PASS: confirmed publication recovered after store reopen')
 
+  let finalPublication = report
+  let finalRecovered = recovered
+
+  if (REORG_TEST) {
+    const originalBlockHash = report.blockHash
+    if (typeof originalBlockHash !== 'string' || typeof report.blockHeight !== 'number') {
+      throw new Error('Safety stop: confirmed publication has no block inclusion data')
+    }
+    const originalHeader = asRecord(await rpc('getblockheader', [originalBlockHash, true]), 'original block header')
+    if (originalHeader.hash !== originalBlockHash || typeof originalHeader.confirmations !== 'number' || originalHeader.confirmations < 1) {
+      throw new Error('Safety stop: original anchor block is not confirmed on the active chain before reorg')
+    }
+
+    await rpc('invalidateblock', [originalBlockHash])
+    const chainAfterInvalidation = asRecord(await rpc('getblockchaininfo'), 'chain after invalidation')
+    if (chainAfterInvalidation.chain !== 'regtest' || chainAfterInvalidation.bestblockhash === originalBlockHash) {
+      throw new Error('Safety stop: invalidated anchor block remains the active regtest tip')
+    }
+    const orphanedHeader = asRecord(await rpc('getblockheader', [originalBlockHash, true]), 'orphaned block header')
+    if (orphanedHeader.confirmations !== -1) {
+      throw new Error('Safety stop: Core did not report the original anchor block as outside the active chain')
+    }
+    console.log('PASS: original anchor inclusion removed from the active chain')
+
+    const invalidatedPublication = await invalidateBtcsL1PublicationAfterConfirmedReorg(
+      publicationStore, preparation.batchHash, originalBlockHash,
+    )
+    if (invalidatedPublication.state !== 'invalidated') {
+      throw new Error(`Expected invalidated state; received ${invalidatedPublication.state}`)
+    }
+    const reopenedInvalidatedStore = await BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+    const recoveredInvalidated = reopenedInvalidatedStore.get(preparation.batchHash)
+    if (recoveredInvalidated === undefined || recoveredInvalidated.state !== 'invalidated' ||
+      JSON.stringify(recoveredInvalidated) !== JSON.stringify(invalidatedPublication)) {
+      throw new Error('Invalidated publication was not durably recovered after store reopen')
+    }
+    console.log('PASS: reorg invalidation persisted and survived store reopen')
+    const replacementMiningAddress = await rpc('getnewaddress', [], true)
+    if (
+      typeof replacementMiningAddress !== 'string' ||
+      replacementMiningAddress === miningAddress
+    ) {
+      throw new Error('Safety stop: replacement branch must use a distinct wallet address')
+    }
+    const replacementMined = await rpc('generatetoaddress', [1, replacementMiningAddress])
+    if (!Array.isArray(replacementMined) || typeof replacementMined[0] !== 'string') {
+      throw new Error('Core did not return a replacement-branch block hash')
+    }
+    const replacementBlockHash = replacementMined[0]
+    if (replacementBlockHash === originalBlockHash) {
+      throw new Error('Safety stop: replacement branch reused the invalidated block hash')
+    }
+    const replacementBlock = asRecord(await rpc('getblock', [replacementBlockHash, 1]), 'replacement block')
+    const replacementTxs = replacementBlock.tx
+    let reincludeBlockHash: string | undefined =
+      Array.isArray(replacementTxs) && replacementTxs.includes(txid) ? replacementBlockHash : undefined
+    const replacementTip = asRecord(await rpc('getblockchaininfo'), 'replacement-chain info')
+    if (replacementTip.chain !== 'regtest' || replacementTip.bestblockhash !== replacementBlockHash) {
+      throw new Error('Safety stop: replacement branch did not become the active regtest tip')
+    }
+    const stillOrphanedHeader = asRecord(await rpc('getblockheader', [originalBlockHash, true]), 'reorged block header')
+    if (stillOrphanedHeader.confirmations !== -1) {
+      throw new Error('Safety stop: original inclusion unexpectedly returned to the active chain')
+    }
+    console.log(`PASS: replacement branch is active (${replacementBlockHash})`)
+
+
+    if (reincludeBlockHash === undefined) {
+      const mempool = await rpc('getrawmempool')
+      if (!Array.isArray(mempool)) throw new Error('Core returned an invalid mempool result')
+      if (!mempool.includes(txid)) {
+        const rebroadcastTxid = await rpc('sendrawtransaction', [signed.hex])
+        if (rebroadcastTxid !== txid) throw new Error('Rebroadcast returned a different transaction ID')
+      }
+      for (let attempt = 0; attempt < 3 && reincludeBlockHash === undefined; attempt++) {
+        const retryMined = await rpc('generatetoaddress', [1, miningAddress])
+        if (!Array.isArray(retryMined) || typeof retryMined[0] !== 'string') {
+          throw new Error('Core did not return a recovery block hash')
+        }
+        const candidateHash = retryMined[0]
+        const candidateBlock = asRecord(await rpc('getblock', [candidateHash, 1]), 'recovery block')
+        if (Array.isArray(candidateBlock.tx) && candidateBlock.tx.includes(txid)) {
+          reincludeBlockHash = candidateHash
+        }
+      }
+    }
+    if (reincludeBlockHash === undefined) {
+      throw new Error('Safety stop: anchor transaction was not re-included within three recovery blocks')
+    }
+    const reobservedPublication = await verifyAndAdvanceBtcsL1PublicationInStore(
+      confirmationRpc, publicationStore, preparation.batchHash, reincludeBlockHash,
+    )
+    if (reobservedPublication.state !== 'confirmed' || reobservedPublication.blockHash !== reincludeBlockHash) {
+      throw new Error('Publication did not recover to confirmed state on its replacement inclusion')
+    }
+    const reopenedRecoveredStore = await BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+    const durableRecovery = reopenedRecoveredStore.get(preparation.batchHash)
+    if (durableRecovery === undefined || durableRecovery.state !== 'confirmed' ||
+      JSON.stringify(durableRecovery) !== JSON.stringify(reobservedPublication)) {
+      throw new Error('Recovered confirmed publication did not survive store reopen')
+    }
+    finalPublication = reobservedPublication
+    finalRecovered = durableRecovery
+    console.log('PASS: publication re-observed and confirmed on the replacement branch')
+    console.log('PASS: recovered confirmation persisted and survived store reopen')
+  }
+
   console.log('\n=== VERIFIED REGTEST ANCHOR ===')
   console.log(JSON.stringify({
     network: 'regtest',
@@ -246,8 +365,8 @@ async function main() {
       dataHex: preparation.dataHex,
       scriptPubKeyHex: preparation.scriptPubKeyHex,
     },
-    publication: report,
-    recoveredPublication: recovered,
+    publication: finalPublication,
+    recoveredPublication: finalRecovered,
   }, null, 2))
 }
 
