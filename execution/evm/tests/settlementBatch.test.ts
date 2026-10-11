@@ -3,10 +3,17 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { createContractAddress, hexToBytes } from '@ethereumjs/util'
 import { PersistentBlockProcessor, ProtocolError } from '../src/blockProcessor.js'
 import { createEvmSettlementEnvelope, ZERO_COMMITMENT } from '../src/settlementEnvelope.js'
+import { SENDER_ADDRESS } from '../src/config.js'
+import { compileCounter } from '../src/compile.js'
+import { signFeeMarketTransaction } from '../src/transactions.js'
 import { createEvmSettlementBatch, verifyEvmSettlementBatch } from '../src/settlementBatch.js'
-import { verifyEvmSettlementBatchExecution } from '../src/settlementBatchReplay.js'
+import {
+  verifyEvmSettlementBatchExecution,
+  verifyEvmSettlementBatchExecutionFromCheckpoint,
+} from '../src/settlementBatchReplay.js'
 
 const ZERO_HASH = `0x${'0'.repeat(64)}`
 
@@ -161,16 +168,37 @@ test('independent replay verifies a valid genesis-plus-child batch', async () =>
   })
 })
 
-test('independent replay rejects a valid non-genesis continuation until checkpoint replay is supported', async () => {
+test('checkpoint replay preserves contract state and verifies a non-genesis continuation', async () => {
   await withStore(async (directory) => {
     const processor = await PersistentBlockProcessor.open(directory)
+    const compiled = compileCounter()
+    const contractAddress = createContractAddress(SENDER_ADDRESS, 0n)
+    const incrementSelector = compiled.methodIdentifiers['increment()']
+    assert.ok(incrementSelector)
+
+    const deployment = signFeeMarketTransaction({
+      nonce: 0n,
+      data: compiled.creationBytecode,
+      gasLimit: 500_000n,
+    })
+    const increment = signFeeMarketTransaction({
+      nonce: 1n,
+      to: contractAddress,
+      data: hexToBytes(`0x${incrementSelector}`),
+      gasLimit: 150_000n,
+    })
 
     const view0 = await processor.createCanonicalReadView()
     const genesis = view0.getCanonicalBlockByNumber(0n)
     assert.ok(genesis)
     const envelope0 = createEvmSettlementEnvelope(genesis.blockRlpHex)
 
-    await processor.buildNextBlock([], 1_750_000_001n)
+    const deployed = await processor.buildNextBlock(
+      [deployment],
+      1_750_000_001n,
+    )
+    assert.equal(deployed.summary.receipts[0]?.status, 1)
+
     const view1 = await processor.createCanonicalReadView()
     const block1 = view1.getCanonicalBlockByNumber(1n)
     assert.ok(block1)
@@ -179,27 +207,67 @@ test('independent replay rejects a valid non-genesis continuation until checkpoi
       envelope0.commitmentHash,
     )
 
-    await processor.buildNextBlock([], 1_750_000_002n)
-    const view2 = await processor.createCanonicalReadView()
-    const block2 = view2.getCanonicalBlockByNumber(2n)
+    const checkpointPath = join(directory, 'checkpoint')
+    const manifest = await processor.exportStateCheckpoint(checkpointPath)
+    assert.equal(manifest.blockHeight, '1')
+    assert.equal(manifest.blockHash, envelope1.blockHash)
+    assert.equal(manifest.stateRoot, envelope1.stateRoot)
+
+    const incremented = await processor.buildNextBlock(
+      [increment],
+      1_750_000_002n,
+    )
+    assert.equal(incremented.summary.receipts[0]?.status, 1)
+
+    const canonicalView = await processor.createCanonicalReadView()
+    const block2 = canonicalView.getCanonicalBlockByNumber(2n)
     assert.ok(block2)
     const envelope2 = createEvmSettlementEnvelope(
       block2.blockRlpHex,
       envelope1.commitmentHash,
     )
+    const continuationBatch = createEvmSettlementBatch([envelope2])
 
-    const continuationBatch = createEvmSettlementBatch([envelope1, envelope2])
-    assert.equal(continuationBatch.startHeight, '1')
-    assert.equal(continuationBatch.endHeight, '2')
+    const report = await verifyEvmSettlementBatchExecutionFromCheckpoint(
+      continuationBatch,
+      envelope1.commitmentHash,
+      envelope1.blockHash,
+      '2',
+      checkpointPath,
+      canonicalView,
+    )
+
+    assert.equal(report.executionVerified, true)
+    assert.equal(report.blocksVerified, 1)
+    assert.equal(report.childBlocksReexecuted, 1)
+    assert.equal(report.startHeight, '2')
+    assert.equal(report.endHeight, '2')
+    assert.equal(report.checkpointHeight, '1')
+    assert.equal(report.checkpointAncestryBlocksLoaded, 2)
+    assert.equal(report.batchHash, continuationBatch.batchHash)
+
+    // A canonical checkpoint is not sufficient if it is more than one
+    // block behind the batch's first block.
+    await processor.buildNextBlock([], 1_750_000_003n)
+    const view3 = await processor.createCanonicalReadView()
+    const block3 = view3.getCanonicalBlockByNumber(3n)
+    assert.ok(block3)
+    const envelope3 = createEvmSettlementEnvelope(
+      block3.blockRlpHex,
+      envelope2.commitmentHash,
+    )
+    const gapBatch = createEvmSettlementBatch([envelope3])
 
     await assert.rejects(
-      verifyEvmSettlementBatchExecution(
-        continuationBatch,
-        envelope0.commitmentHash,
-        envelope0.blockHash,
-        '1',
+      verifyEvmSettlementBatchExecutionFromCheckpoint(
+        gapBatch,
+        envelope2.commitmentHash,
+        envelope2.blockHash,
+        '3',
+        checkpointPath,
+        view3,
       ),
-      /independent replay currently requires a batch starting at genesis height 0/,
+      /checkpoint height must be exactly one block before the batch start/,
     )
   })
 })

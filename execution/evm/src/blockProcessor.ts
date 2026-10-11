@@ -165,7 +165,7 @@ type ChainMetadata = {
   canonicalTipHash: string
 }
 
-type ReplayStateManager = Awaited<ReturnType<typeof openDurableStateManager>>['stateManager']
+export type ReplayStateManager = Awaited<ReturnType<typeof openDurableStateManager>>['stateManager']
 
 type ReplaySession = {
   vm: Awaited<ReturnType<typeof createVM>>
@@ -473,7 +473,10 @@ class CanonicalBlockHashLookup implements EVMMockBlockchainInterface {
   }
 }
 
-async function createExecutionVM(stateManager?: ReplayStateManager) {
+async function createExecutionVM(
+  stateManager?: ReplayStateManager,
+  options: Readonly<{ initializeGenesisState?: boolean }> = {},
+) {
   const common = createHarnessCommon()
   const blockchain = new CanonicalBlockHashLookup()
   const vm = await createVM({
@@ -483,18 +486,26 @@ async function createExecutionVM(stateManager?: ReplayStateManager) {
     ...(stateManager === undefined ? {} : { stateManager }),
   })
 
+  if (options.initializeGenesisState !== false) {
+    await initializeGenesisState(vm)
+  }
+
+  return { vm, common, blockchain }
+}
+
+async function initializeGenesisState(
+  vm: Awaited<ReturnType<typeof createVM>>,
+): Promise<void> {
   // EthereumJS skips automatic precompile-account initialization when a
-  // custom state manager is supplied, so reproduce its initialization here.
-  if (stateManager !== undefined) {
-    for (const [addressStr] of getActivePrecompiles(common)) {
-      const address = new Address(unprefixedHexToBytes(addressStr))
-      if (await vm.stateManager.getAccount(address) === undefined) {
-        const account = new Account()
-        await vm.stateManager.putAccount(
-          address,
-          createAccount({ balance: 1, storageRoot: account.storageRoot }),
-        )
-      }
+  // custom state manager is supplied, so reproduce it for genesis replay.
+  for (const [addressStr] of getActivePrecompiles(vm.evm.common)) {
+    const address = new Address(unprefixedHexToBytes(addressStr))
+    if (await vm.stateManager.getAccount(address) === undefined) {
+      const account = new Account()
+      await vm.stateManager.putAccount(
+        address,
+        createAccount({ balance: 1, storageRoot: account.storageRoot }),
+      )
     }
   }
 
@@ -502,7 +513,6 @@ async function createExecutionVM(stateManager?: ReplayStateManager) {
     SENDER_ADDRESS,
     createAccount({ balance: GENESIS_BALANCE }),
   )
-  return { vm, common, blockchain }
 }
 
 async function createGenesisBlock(vm: Awaited<ReturnType<typeof createVM>>): Promise<Block> {
@@ -1448,6 +1458,196 @@ export class PersistentBlockProcessor {
     }
   }
 }
+
+
+export type CheckpointContinuationReplay = Readonly<{
+  blocks: readonly ProcessedBlock[]
+  checkpointAncestryBlocksLoaded: number
+}>
+
+/**
+ * Re-executes child blocks from a checkpoint already recovered against a
+ * replay-verified canonical view. The supplied state manager remains owned
+ * by the caller and is never initialized with genesis balances.
+ *
+ * This verifies local execution only. It does not prove BTCS L1 publication,
+ * settlement, finality, or trusted-anchor authenticity.
+ */
+export async function reexecuteFromVerifiedCheckpoint(
+  canonicalView: CanonicalReadView,
+  stateManager: ReplayStateManager,
+  checkpoint: Pick<
+    StateCheckpointManifest,
+    'profileId' | 'blockHeight' | 'blockHash' | 'stateRoot'
+  >,
+  childBlockRlpHexes: readonly string[],
+): Promise<CheckpointContinuationReplay> {
+  if (checkpoint.profileId !== LOCAL_CHAIN_PROFILE) {
+    throw new ProtocolError('checkpoint continuation uses the wrong execution profile')
+  }
+  if (childBlockRlpHexes.length === 0) {
+    throw new ProtocolError('checkpoint continuation must contain at least one child block')
+  }
+
+  const checkpointHeight = parseCanonicalUint(
+    checkpoint.blockHeight,
+    'checkpoint block height',
+    MAX_BLOCK_NUMBER,
+  )
+  const checkpointData = canonicalView.getCanonicalBlockByNumber(checkpointHeight)
+  if (checkpointData === undefined) {
+    throw new ProtocolError('checkpoint height is absent from canonical history')
+  }
+
+  const checkpointSummary = checkpointData.summary
+  if (
+    checkpointSummary.number !== checkpoint.blockHeight ||
+    checkpointSummary.hash.toLowerCase() !== checkpoint.blockHash.toLowerCase() ||
+    checkpointSummary.stateRoot.toLowerCase() !== checkpoint.stateRoot.toLowerCase()
+  ) {
+    throw new ProtocolError('checkpoint identity or state root differs from canonical history')
+  }
+
+  const recoveredRoot = asBytesHex(await stateManager.getStateRoot())
+  if (recoveredRoot !== checkpoint.stateRoot.toLowerCase()) {
+    throw new ProtocolError(
+      `recovered checkpoint state root mismatch: expected ${checkpoint.stateRoot}, got ${recoveredRoot}`,
+    )
+  }
+
+  const { vm, common, blockchain } = await createExecutionVM(
+    stateManager,
+    { initializeGenesisState: false },
+  )
+  await vm.stateManager.setStateRoot(
+    hexToBytes(checkpoint.stateRoot as `0x${string}`),
+  )
+  const vmRoot = asBytesHex(await vm.stateManager.getStateRoot())
+  if (vmRoot !== checkpoint.stateRoot.toLowerCase()) {
+    throw new ProtocolError('execution VM did not retain the recovered checkpoint state root')
+  }
+
+  // EVM BLOCKHASH can access at most the prior 256 block heights. Load that
+  // exact suffix, including the checkpoint block, from verified local history.
+  const historyWindow = BigInt(MAX_BLOCKHASH_HISTORY - 1)
+  const ancestryStart = checkpointHeight > historyWindow
+    ? checkpointHeight - historyWindow
+    : 0n
+
+  let parent: Block | undefined
+  let checkpointBlock: Block | undefined
+  let checkpointAncestryBlocksLoaded = 0
+
+  for (let height = ancestryStart; height <= checkpointHeight; height++) {
+    const canonical = canonicalView.getCanonicalBlockByNumber(height)
+    if (canonical === undefined) {
+      throw new ProtocolError(`required checkpoint ancestry block ${height} is missing`)
+    }
+
+    let block: Block
+    try {
+      block = createBlockFromRLP(
+        hexToBytes(canonical.blockRlpHex as `0x${string}`),
+        { common },
+      )
+    } catch (error) {
+      throw new ProtocolError(
+        `checkpoint ancestry block ${height} cannot be decoded: ${messageOf(error)}`,
+      )
+    }
+
+    const summary = canonical.summary
+    if (
+      block.header.number !== height ||
+      asBytesHex(block.hash()) !== summary.hash.toLowerCase() ||
+      asBytesHex(block.header.parentHash) !== summary.parentHash.toLowerCase() ||
+      asBytesHex(block.header.stateRoot) !== summary.stateRoot.toLowerCase() ||
+      asBytesHex(block.header.transactionsTrie) !== summary.transactionsRoot.toLowerCase() ||
+      asBytesHex(block.header.receiptTrie) !== summary.receiptsRoot.toLowerCase()
+    ) {
+      throw new ProtocolError(
+        `checkpoint ancestry block ${height} differs from its canonical summary`,
+      )
+    }
+
+    if (parent !== undefined) {
+      validateChildHeader(block, parent, common)
+    }
+    await blockchain.putBlock(block)
+    parent = block
+    checkpointAncestryBlocksLoaded += 1
+
+    if (height === checkpointHeight) checkpointBlock = block
+  }
+
+  if (checkpointBlock === undefined || parent === undefined) {
+    throw new ProtocolError('checkpoint block was not loaded into the execution ancestry')
+  }
+
+  const reexecuted: ProcessedBlock[] = []
+  parent = checkpointBlock
+
+  for (const blockRlpHex of childBlockRlpHexes) {
+    let block: Block
+    try {
+      block = createBlockFromRLP(
+        hexToBytes(blockRlpHex as `0x${string}`),
+        { common },
+      )
+    } catch (error) {
+      throw new ProtocolError(
+        `continuation block cannot be decoded: ${messageOf(error)}`,
+      )
+    }
+
+    if (asBytesHex(block.serialize()) !== blockRlpHex) {
+      throw new ProtocolError('continuation block RLP is not canonical')
+    }
+    validateChildHeader(block, parent, common)
+    canonicalizeTransactionBytes(
+      block.transactions.map((tx) => new Uint8Array(tx.serialize())),
+      common,
+      block.header.baseFeePerGas!,
+    )
+
+    let result: RunBlockResult
+    try {
+      result = await runBlock(vm, {
+        block,
+        skipHeaderValidation: true,
+        skipBlockValidation: false,
+        skipHardForkValidation: false,
+        setHardfork: false,
+        validateBlockSize: false,
+      })
+    } catch (error) {
+      throw new ProtocolError(
+        `checkpoint continuation replay failed at block ${block.header.number}: ${messageOf(error)}`,
+      )
+    }
+
+    const summary = blockSummary(block, outcomesFromRunResult(block, result))
+    const actualStateRoot = asBytesHex(await vm.stateManager.getStateRoot())
+    if (actualStateRoot !== summary.stateRoot.toLowerCase()) {
+      throw new ProtocolError(
+        `replayed state root mismatch at block ${block.header.number}: expected ${summary.stateRoot}, got ${actualStateRoot}`,
+      )
+    }
+
+    reexecuted.push({
+      blockRlpHex: asBytesHex(block.serialize()),
+      summary,
+    })
+    await blockchain.putBlock(block)
+    parent = block
+  }
+
+  return {
+    blocks: reexecuted,
+    checkpointAncestryBlocksLoaded,
+  }
+}
+
 
 async function persistContentAddressedRecord(
   path: string,

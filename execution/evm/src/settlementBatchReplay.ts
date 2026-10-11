@@ -3,9 +3,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { hexToBytes } from '@ethereumjs/util'
 import {
+  LOCAL_CHAIN_PROFILE,
   PersistentBlockProcessor,
   ProtocolError,
+  reexecuteFromVerifiedCheckpoint,
+  type CanonicalReadView,
 } from './blockProcessor.js'
+import { createHarnessCommon } from './config.js'
+import { recoverStateCheckpoint } from './stateCheckpointRecovery.js'
 import {
   verifyEvmSettlementBatch,
   type EvmSettlementBatch,
@@ -21,6 +26,12 @@ export type EvmSettlementReplayReport = Readonly<{
   batchHash: string
   executionVerified: true
 }>
+
+export type EvmSettlementCheckpointReplayReport =
+  EvmSettlementReplayReport & Readonly<{
+    checkpointHeight: string
+    checkpointAncestryBlocksLoaded: number
+  }>
 
 /**
  * Independently re-executes a genesis-starting batch in a disposable local
@@ -95,6 +106,108 @@ export async function verifyEvmSettlementBatchExecution(
     }
   } finally {
     await rm(directory, { recursive: true, force: true })
+  }
+}
+
+
+/**
+ * Re-executes a non-genesis settlement batch from a recovered checkpoint.
+ *
+ * The checkpoint must match the supplied replay-verified canonical view, and
+ * its block must be the direct parent of the batch's first block. The caller
+ * supplies the previous commitment as an external anchor; this function does
+ * not prove BTCS L1 publication, settlement, finality, or anchor authenticity.
+ */
+export async function verifyEvmSettlementBatchExecutionFromCheckpoint(
+  value: unknown,
+  expectedPreviousCommitment: string,
+  expectedParentHash: string,
+  expectedStartHeight: string,
+  checkpointDirectory: string,
+  canonicalView: CanonicalReadView,
+): Promise<EvmSettlementCheckpointReplayReport> {
+  const batch: EvmSettlementBatch = verifyEvmSettlementBatch(
+    value,
+    expectedPreviousCommitment,
+    expectedParentHash,
+    expectedStartHeight,
+  )
+
+  if (BigInt(batch.startHeight) === 0n) {
+    throw new ProtocolError('checkpoint continuation cannot start at genesis height 0')
+  }
+
+  const localCommon = createHarnessCommon()
+  if (
+    batch.profileId !== LOCAL_CHAIN_PROFILE ||
+    batch.chainId !== localCommon.chainId().toString(10) ||
+    batch.hardfork !== localCommon.hardfork()
+  ) {
+    throw new ProtocolError('settlement batch metadata does not match the pinned local EVM profile')
+  }
+
+  const recovered = await recoverStateCheckpoint(
+    checkpointDirectory,
+    canonicalView,
+    LOCAL_CHAIN_PROFILE,
+  )
+
+  try {
+    const checkpointHeight = BigInt(recovered.manifest.blockHeight)
+    if (checkpointHeight + 1n !== BigInt(batch.startHeight)) {
+      throw new ProtocolError(
+        'checkpoint height must be exactly one block before the batch start',
+      )
+    }
+
+    if (
+      recovered.manifest.blockHash.toLowerCase() !== expectedParentHash.toLowerCase()
+    ) {
+      throw new ProtocolError(
+        'checkpoint block hash does not match the expected batch parent hash',
+      )
+    }
+
+    const replay = await reexecuteFromVerifiedCheckpoint(
+      canonicalView,
+      recovered.stateManager,
+      recovered.manifest,
+      batch.envelopes.map((envelope) => envelope.blockRlpHex),
+    )
+
+    if (replay.blocks.length !== batch.envelopes.length) {
+      throw new ProtocolError('checkpoint replay returned an unexpected block count')
+    }
+
+    for (let index = 0; index < batch.envelopes.length; index += 1) {
+      const envelope = batch.envelopes[index]
+      const processed = replay.blocks[index]
+
+      if (envelope === undefined || processed === undefined) {
+        throw new ProtocolError('checkpoint replay block sequence is incomplete')
+      }
+      if (processed.blockRlpHex !== envelope.blockRlpHex) {
+        throw new ProtocolError(
+          `checkpoint-reexecuted block ${envelope.height} bytes do not match`,
+        )
+      }
+      assertEnvelopeMatchesSummary(envelope, processed.summary)
+    }
+
+    return {
+      format: 'btcs-l2-evm-settlement-replay-report',
+      version: 'v1',
+      startHeight: batch.startHeight,
+      endHeight: batch.endHeight,
+      blocksVerified: batch.envelopes.length,
+      childBlocksReexecuted: batch.envelopes.length,
+      batchHash: batch.batchHash,
+      executionVerified: true,
+      checkpointHeight: recovered.manifest.blockHeight,
+      checkpointAncestryBlocksLoaded: replay.checkpointAncestryBlocksLoaded,
+    }
+  } finally {
+    await recovered.close()
   }
 }
 
