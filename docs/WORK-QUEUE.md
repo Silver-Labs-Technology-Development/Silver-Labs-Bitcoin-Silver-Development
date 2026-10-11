@@ -6,7 +6,8 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 
 | Task ID | Task | Status | Deliverable | Next action |
 |---|---|---|---|---|
-| BTCS-L2-CLIENT-001 | Client integration, use cases, and communication | READY_FOR_REVIEW | docs/CLIENT-INTEGRATION-PLAN-v0.1.md | Report saved and evidence verified; human review of capabilities, roadmap, and next task BTCS-L2-CLIENT-002 |
+| BTCS-L2-CLIENT-001 | Client integration, use cases, and communication | COMPLETE | docs/CLIENT-INTEGRATION-PLAN-v0.1.md | Reviewed and committed as 4d27324 |
+| BTCS-L2-CLIENT-002 | Reproducible local client demonstration | READY_FOR_AGENT | execution/evm/scripts/demo-client.ts and README | Implement the demo defined in plan section 6 |
 
 ## Working rules
 
