@@ -18,14 +18,14 @@ statements.
 **Position:** the local execution, persistence/replay/checkpoint, settlement,
 deposit-recovery, and local cross-process locking prototypes are implemented.
 Under Node `v24.17.0`, `npm run typecheck` passes and the full EVM suite passes
-236/236. A real BTCS Core regtest run confirmed a 0.1 BTC L1 deposit, verified
-and persisted the deposit record, committed the matching L2 credit, and
-independently replayed a v2 settlement batch with matching state root and
-recipient balance. The run used trusted local Core RPC and did not publish a
-settlement anchor or simulate an L1 reorganization. Local chain-directory
-coordination is implemented for cooperating processes on one local filesystem;
-the spend evidence remains conservative address-level evidence. **This is a
-verified prototype, not a production rollup or trustless bridge.**
+242/242. Real BTCS Core regtest runs confirmed a 0.1 BTC L1 deposit and L2
+settlement, published a settlement commitment, and published/reconstructed a
+4,472-byte batch from 128 L1 data fragments. These runs use trusted local Core
+RPC; the new batch-data format is capped at 16 KiB and the watcher has not had a
+live reorg test. Local chain-directory coordination is implemented for
+cooperating processes on one local filesystem; the spend evidence remains
+conservative address-level evidence. **This is a verified prototype, not a
+production rollup or trustless bridge.**
 
 | Workstream | Current status | Evidence and boundary |
 | :--- | :--- | :--- |
@@ -34,17 +34,20 @@ verified prototype, not a production rollup or trustless bridge.**
 | Settlement envelopes and batch verification | **Prototype implemented and tested** | Ordered batches, parent/commitment links, deterministic hashes, independent execution replay and tamper rejection are covered by the local suite. |
 | Local RPC and development sequencer | **Prototype implemented and tested** | Loopback-only read RPC and explicit development transaction production are covered. Pending transactions are in memory and are lost on process restart. |
 | Client integration demo (`BTCS-L2-CLIENT-002`) | **READY_FOR_REVIEW** | The demo test and batch-verifier integration test pass in the reported suite. The work queue requires human review before marking the task complete. |
-| BTCS L1 anchor publication | **One-shot regtest publication E2E PASS; data availability PARTIAL** | A signed transaction with one verified batch commitment was mempool-accepted, confirmed at height 305, and its durable publication record survived reopen. The batch body was not published; see docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md. |
+| BTCS L1 anchor and batch data | **Commitment and bounded data publication/reconstruction E2Es PASS; scalable availability PARTIAL** | A signed batch commitment was confirmed at height 305. A 4,472-byte canonical batch was published as 128 fragments plus its commitment and reconstructed byte-for-byte from active Core block outputs at height 507. The 16 KiB cap and trusted-Core requirement are prototype limits; see both saved regtest result files. |
 | BTCS L1 deposits and L2 credit | **Deposit-prelude prototype implemented; real regtest E2E PASS** | A 0.1 BTC deposit was verified through trusted local Core RPC, stored durably, credited into the L2 state root, and included in an independently replayed v2 settlement batch. See `docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`. |
-| Deposit reorganization and recovery | **Fail-closed prototype and polling watcher implemented; source attribution remains partial** | Canonical EVM replay tracks native value outflow, fees, and selfdestructs; local recovery freezes, re-derives, and adopts under a cross-process directory lock. The watcher persists a bounded cursor, reconciles shallow reorgs, and fails closed on deeper reorgs; scheduled operation and multi-host coordination are not implemented. |
+| BTCS L1 deposit monitoring and reorg handling | **Bounded one-process polling watcher implemented and unit tested** | The watcher persists a recent-chain cursor, records only confirmed deposits, invalidates shallow-reorg inclusions, re-observes replacements, and fails closed beyond retained history. It reports IDs for operator recovery; continuous scheduling, live watcher reorg E2E, and multi-host coordination remain open. |
+| Deposit reorganization and recovery | **Fail-closed prototype implemented; source attribution remains partial** | Canonical EVM replay tracks native value outflow, fees, and selfdestructs; local recovery freezes, re-derives, and adopts under a cross-process directory lock. Address-level spend evidence can false-positive among fungible credits. |
+| L1 batch data | **16 KiB fragment prototype and live regtest reconstruction PASS** | The codec reconstructs canonical batch bytes from caller-supplied Core block outputs and verifies trusted anchors plus the existing batch hash. It is not an inclusion proof, does not track L1 reorgs, and is not a scalable DA design. See `docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md`. |
 | Production rollup security | **Not delivered** | Trust-minimized custody, withdrawals, forced inclusion, complete data availability and clean-node reconstruction from BTCS data, fraud/validity proof enforcement, and production reorg/accounting guarantees remain open. |
 
 ### Latest verified evidence
 
-In `execution/evm`, Node `v24.17.0` passes `npm run typecheck` and the full
-EVM suite passes **236/236**, including seven deposit-watcher tests. The real deposit-to-settlement E2E also passes.
-Its full result, identifiers, and limits are recorded in
-`docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`.
+In `execution/evm`, Node `v24.17.0` passes `npm run typecheck` and the full EVM
+suite passes **242/242**, including seven deposit-watcher and six batch-data
+tests. The real deposit-to-settlement, anchor-publication, and batch-data
+publication/reconstruction E2Es pass. Their result files preserve identifiers
+and limits.
 
 ### Deposit E2E configuration and observed effects
 
@@ -75,7 +78,7 @@ This is **not a trustless bridge**. The current implementation does not itself p
 | **1 — EVM execution** | Local prototype broadly tested; pinned-runtime acceptance still outstanding | Run typecheck, full suite, client demo and verifier under Node `24.17.0`; later differential testing and production-engine decision. |
 | **2 — Storage, replay and recovery** | Persistence, canonical replay, checkpoint continuation tested | Define trusted bootstrap from L1-published data; broaden crash/corruption/reorg recovery. |
 | **3 — Settlement envelopes and batches** | Local validation and independent replay tested; deposit settlement passed on regtest | Maintain adversarial coverage; connect publication to L1 and reconstruct published batch data. |
-| **4 — BTCS L1 settlement and deposits** | Deposit-to-settlement and one-shot anchor-publication E2Es PASS; a bounded deposit watcher is implemented; batch-data availability remains incomplete | Publish and reconstruct complete batch data, then test watcher operation against regtest and define service scheduling/restart behavior. |
+| **4 — BTCS L1 settlement and deposits** | Deposit-to-settlement, commitment publication, and bounded batch-data publication/reconstruction E2Es PASS; watcher code is implemented | Add reorg-aware fragment/anchor availability tracking, test watcher behavior against regtest, and define scheduled polling/restart behavior. |
 | **5 — Rollup security** | Local recovery is fail-closed; production security mechanisms remain unimplemented | Specify and prototype data availability, forced inclusion, disputes/proofs, withdrawals, and enforceable bridge custody/accounting. |
 | **6 — Production readiness** | Not reached | Independent security review, adversarial testnet, operational recovery drills, monitoring and governance. |
 
@@ -85,11 +88,12 @@ This is **not a trustless bridge**. The current implementation does not itself p
 and the real deposit-to-settlement E2E are saved as `READY_FOR_REVIEW` items in
 `docs/WORK-QUEUE.md`; none is marked `COMPLETE` pending human review.
 
-**Next bounded integration target:** define and implement L1 batch-data
-publication and reconstruction. The deposit watcher and one-shot anchor
-publication are saved as `READY_FOR_REVIEW` tasks; the work queue requires human
-review before marking them complete. Keep trusted-Core-RPC, local-filesystem,
-and prototype security boundaries explicit.
+**Next bounded integration target:** track anchor and batch-data fragments
+through reorgs and test deposit-watcher/reconstruction recovery against regtest.
+The deposit watcher, one-shot anchor, and batch-data publication are saved as
+`READY_FOR_REVIEW` tasks; the work queue requires human review before marking
+them complete. Keep trusted-Core-RPC, local-filesystem, and prototype security
+boundaries explicit.
 
 **Later gates:** proof/dispute enforcement, forced inclusion, withdrawals, and
 trust-minimized custody require separate protocol designs and adversarial

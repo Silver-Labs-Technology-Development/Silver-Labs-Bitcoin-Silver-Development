@@ -219,6 +219,45 @@ the ordinary publication run.
 
 Recorded live run: [regtest anchor publication results](../../docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md).
 
+<a id="regtest-batch-data-e2e"></a>
+
+## Regtest settlement batch data publication (`e2e:batch-data`)
+
+`npm run e2e:batch-data` independently verifies a two-block sample settlement
+batch, publishes its complete canonical JSON bytes as bounded BTCS data-carrier
+fragments, and publishes the matching settlement commitment in a separate
+transaction. Each fragment repeats the existing 32-byte batch hash plus its
+index/count/total-length metadata. The current format allows at most 16 KiB per
+batch, splits it into 35-byte chunks, and uses one zero-value OP_RETURN output
+per transaction (at most 83 script bytes). This is a small prototype format,
+not a scalable data-availability design.
+
+The runner requires an already running local Core `regtest` daemon, a loaded
+test wallet with mature funds, and its readable RPC cookie. It never starts or
+stops Core. Defaults use port `29443`, wallet `btcs-l2-anchor-regtest`, and
+`~/.local/share/btcs-l2-regtest-core`; override them with
+`BTCS_L2_BATCH_DATA_REGTEST_HOST` (loopback only),
+`BTCS_L2_BATCH_DATA_REGTEST_PORT`, `BTCS_L2_BATCH_DATA_REGTEST_WALLET`, and
+`BTCS_L2_BATCH_DATA_REGTEST_DATADIR` (the corresponding `BTCS_L2_REGTEST_*`
+settings are accepted as fallbacks).
+
+On success, the script broadcasts one transaction for each fragment plus one
+commitment transaction, mines one regtest block, verifies every transaction is
+in that active block, checks the commitment through trusted Core RPC, rebuilds
+the bytes from block transaction outputs, and verifies the reconstructed batch
+against its trusted start anchors and existing `batchHash`. It leaves the daemon
+and test wallet running and persistent. If publication stops midway, some
+fragment transactions may remain in the mempool without an anchor or complete
+data set. The recorded run is saved at
+[`docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md`](../../docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md).
+
+Reconstruction accepts only the Core blocks supplied by the caller. Fetch them
+by active-chain hash and apply the desired confirmation policy first. The
+fragment decoder rejects missing indexes, duplicates, conflicting metadata,
+noncanonical bytes, incorrect trusted anchors, and a batch hash mismatch. It is
+not an SPV proof, does not itself track reorgs, and does not establish data
+availability after an L1 reorganization.
+
 <a id="regtest-deposit-settlement-e2e"></a>
 
 ## Regtest deposit-to-settlement E2E (`e2e:deposit`)
