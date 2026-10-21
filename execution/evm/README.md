@@ -304,12 +304,50 @@ Recorded live run: [regtest deposit-to-settlement results](../../docs/REGTEST-DE
 ### Unresolved issues
 
 L1 deposit verification uses a trusted local Core RPC; it is not a trustless
-inclusion proof. Automatic, in-place adoption of a re-derived chain and
-automatic attribution of an EVM spend to a specific credit remain **not**
+inclusion proof. The watcher below records confirmed deposits and reports
+invalidations, but an operator still has to invoke L2 recovery. Automatic
+attribution of an EVM spend to a specific fungible credit remains **not**
 implemented; see the deposit reorg accounting and recovery sections below. When
 a descendant transaction depended on a removed credit, recovery fails closed and
 the chain store is frozen. Withdrawals, production escrow, and data availability
 are also out of scope.
+
+<a id="l1-deposit-watcher"></a>
+
+## L1 deposit watcher (`btcsL1DepositWatcher`)
+
+`src/btcsL1DepositWatcher.ts` is a programmatic, one-process polling component
+that scans an explicitly configured BTCS payment script from a configured start
+height. It requires `chain=regtest`, uses trusted Core RPC, and writes a durable
+cursor plus recent active-chain hashes to a dedicated cursor directory. The
+cursor retains up to 10,000 blocks (288 by default); a deeper reorg stops with a
+typed error and requires operator investigation. The watcher persists only
+deposits that meet the configured confirmation count. It returns discovered,
+re-observed, and invalidated deposit IDs but never credits or changes L2 state.
+
+Create a cursor once with `BtcsL1DepositWatcher.create`, then use
+`BtcsL1DepositWatcher.open` on later starts. Supply an opened
+`BtcsL1DepositStore` and an authenticated `BtcsL1CoreRpcClient`. Call
+`pollOnce()` on the desired schedule and always call `close()` in a `finally`
+block. The watcher holds OS-level locks on its dedicated cursor and deposit
+store directories for its lifetime, so another watcher cannot race either
+file. Use separate stores for independently watched scripts. After an unclean
+process exit, a stale lock fails closed; check that the old process is stopped
+before removing the lock as described under [local chain locking](#v011-local-block-processor).
+Use the returned `invalidatedDepositIds` to start the existing operator recovery
+workflow. A temporary RPC failure leaves the last persisted cursor in place and
+does not invalidate a deposit.
+
+The watcher does not prove inclusion independently of Core, run continuously by
+itself, or automatically rederive L2. It is configured for one payment script;
+create another watcher with separate cursor and deposit store directories for
+each script.
+The unit tests run entirely against simulated Core responses:
+
+```sh
+npm run typecheck
+./node_modules/.bin/tsx --test tests/btcsL1DepositWatcher.test.ts
+```
 
 <a id="deposit-reorg-accounting"></a>
 
@@ -340,9 +378,10 @@ The module is deliberately conservative and honest about its limits:
 
 This is conservative address-level evidence, not source-specific attribution
 among fungible credits: spending from an address can freeze recovery even when
-pre-existing or later funds covered the outflow. Recovery still requires an
-operator invocation, and cross-process writer/recovery coordination is not
-implemented. This does not make the bridge trustless or production-safe. See
+pre-existing or later funds covered the outflow. Local cross-process writer and
+recovery coordination is implemented for cooperating processes on one
+filesystem; multi-host coordination is not. Recovery still requires an operator
+invocation. This does not make the bridge trustless or production-safe. See
 `docs/DEPOSIT-REORG-ACCOUNTING-v0.1.md`.
 
 <a id="deposit-reorg-recovery"></a>
@@ -406,7 +445,8 @@ cooperating processes on one local filesystem. It does not provide multi-host
 leases or protect against direct filesystem edits.
 
 **Still partial:** source-specific attribution among fungible credits,
-automatic L1 watcher action, and multi-host coordination. See
+automatic invocation of the watcher and recovery on a schedule, and multi-host
+coordination. See
 `docs/DEPOSIT-REORG-RECOVERY-v0.1.md`.
 
 ## Fixed execution assumptions

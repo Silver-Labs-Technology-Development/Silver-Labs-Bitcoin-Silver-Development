@@ -16,6 +16,8 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 | BTCS-L2-SECURITY-005 | Canonical EVM spend evidence and conservative reorg classification | READY_FOR_REVIEW | execution/evm/src/blockProcessor.ts, execution/evm/src/depositReorgAccounting.ts, execution/evm/tests/depositReorgAccounting.test.ts, docs/DEPOSIT-REORG-ACCOUNTING-v0.1.md | Canonical replay traces direct and nested value transfers, sender fees, and selfdestructs; incomplete evidence freezes unbacked credits, while complete no-outflow evidence permits re-derivation. Node v24.17.0: typecheck passes; focused accounting tests 20/20; full EVM suite 227/227 |
 | BTCS-L2-SECURITY-006 | Coordinate chain writes and deposit recovery across processes | READY_FOR_REVIEW | execution/evm/src/chainDirectoryLock.ts, execution/evm/src/blockProcessor.ts, execution/evm/src/depositReorgRecovery.ts, execution/evm/tests/chainDirectoryLock.test.ts, execution/evm/tests/fixtures/chain-directory-writer.ts, execution/evm/README.md, docs/DEPOSIT-REORG-RECOVERY-v0.1.md | Initialization, canonical writes, read snapshots, checkpoint export, and the complete recovery freeze/rederive/adopt flow use a fail-closed OS file lock and refresh `chain.json`. Two fresh processes serialize genesis and concurrent appends; a stale long-lived processor refreshes, stale/malformed lock tests preserve metadata. Node v24.17.0 typecheck passes; full EVM suite 229/229 |
 | BTCS-L2-L1-001 | Reproducible real regtest settlement-anchor publication | READY_FOR_REVIEW | execution/evm/package.json, execution/evm/scripts/regtest-anchor-e2e.ts, execution/evm/README.md, docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md | Node v24.17.0 npm run e2e:anchor PASS: signed transaction with exactly one expected anchor was mempool-accepted, confirmed at block 305, independently matched the 2-block batch commitment, and the confirmed publication record survived store reopen. Batch body was not published. |
+| BTCS-L2-L1-002 | Poll configured L1 deposit outputs and reconcile reorgs | READY_FOR_REVIEW | execution/evm/src/btcsL1DepositWatcher.ts, execution/evm/src/btcsL1DepositWatchStore.ts, execution/evm/src/btcsL1DepositStore.ts, execution/evm/src/btcsL1CoreRpc.ts, execution/evm/tests/btcsL1DepositWatcher.test.ts, execution/evm/README.md | Node v24.17.0 typecheck passes; watcher tests 7/7; integrated EVM suite 236/236. Lifetime OS locks cover cursor and deposit store; durable bounded cursor, confirmed-only records, shallow-reorg invalidation/re-inclusion, temporary RPC fail-safe, and deep-reorg stop are implemented. Watcher reports invalidated IDs; operator invokes L2 recovery. |
+| BTCS-L2-L1-003 | Publish and reconstruct settlement batch data from L1 | READY_FOR_AGENT | execution/evm/src/btcsL1BatchData*.ts, execution/evm/tests/btcsL1BatchData*.test.ts, execution/evm/README.md, docs/ | Design and implement bounded, canonical batch-data publication with content hash, transaction/fragment layout, decoder, and reconstruction from confirmed L1 data. Verify reconstructed bytes against the existing settlement batch hash. Define limits and reorg handling; keep commitment-only anchor publication distinct from data availability. |
 
 ## Acceptance criteria
 
@@ -40,6 +42,19 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 - Documentation describes configuration, persistent wallet/data/store effects, safe shutdown, and that the L1 transaction publishes only the batch commitment (not the batch data).
 - A live regtest result is saved with transaction, block, and commitment identifiers; destructive reorg mode remains separate and opt-in.
 - Node v24.17.0 npm run e2e:anchor passes against a dedicated regtest; the confirmed publication record survives store reopen.
+
+### BTCS-L2-L1-002
+
+- The watcher scans active-chain blocks using an explicit deposit payment script and start height.
+- Only canonical deposits meeting their configured confirmation threshold enter the durable deposit store.
+- The cursor and recent block hashes persist across reopen; canonical-tip changes rewind to a retained common ancestor and rescan.
+- Confirmed deposit inclusions removed by a reorg are durably invalidated; same-identity re-inclusions are verified and re-observed.
+- Temporary RPC failures never invalidate records or advance the cursor.
+- Invalidated deposit IDs are reported to an operator for the existing L2 recovery workflow; watcher does not credit or mutate L2.
+- A reorg deeper than retained history fails closed with an actionable error; one watcher process is the supported operating mode.
+- The watcher holds OS file locks on its dedicated cursor and deposit store directories for its lifetime, refuses another owner, and releases on `close()`; stale/malformed locks fail closed.
+- Unit tests cover discovery, confirmation delay, cursor reopen, shallow reorg, re-inclusion, deep reorg, RPC failure, and competing owners without Core.
+- Node v24.17.0 typecheck passes; the focused watcher suite passes 7/7; the integrated EVM suite passes 236/236 after the shared-store lock addition.
 
 ### BTCS-L2-SECURITY-001
 

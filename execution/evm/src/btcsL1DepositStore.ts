@@ -421,6 +421,11 @@ export class BtcsL1DepositStore {
     return new BtcsL1DepositStore(resolved, records, options)
   }
 
+  /** Directory containing the durable store, for coordinating cooperating watchers. */
+  get directoryPath(): string {
+    return this.directory
+  }
+
   get(depositId: string): BtcsL1DepositRecord | undefined {
     this.assertUsable()
     validateDepositId(depositId)

@@ -2,7 +2,7 @@
 
 ## Bitcoin Silver Ecosystem Rollup
 
-### Technical Whitepaper Draft v1.2 — Repository Audit and Stage 4 Reproducibility Gate
+### Technical Whitepaper Draft v1.2 — Repository Audit and L1 Integration Update
 
 **Project:** Bitcoin Silver (BTCS)\
 **Development:** Silver Labs Technology & Development\
@@ -18,7 +18,7 @@ statements.
 **Position:** the local execution, persistence/replay/checkpoint, settlement,
 deposit-recovery, and local cross-process locking prototypes are implemented.
 Under Node `v24.17.0`, `npm run typecheck` passes and the full EVM suite passes
-229/229. A real BTCS Core regtest run confirmed a 0.1 BTC L1 deposit, verified
+236/236. A real BTCS Core regtest run confirmed a 0.1 BTC L1 deposit, verified
 and persisted the deposit record, committed the matching L2 credit, and
 independently replayed a v2 settlement batch with matching state root and
 recipient balance. The run used trusted local Core RPC and did not publish a
@@ -36,13 +36,13 @@ verified prototype, not a production rollup or trustless bridge.**
 | Client integration demo (`BTCS-L2-CLIENT-002`) | **READY_FOR_REVIEW** | The demo test and batch-verifier integration test pass in the reported suite. The work queue requires human review before marking the task complete. |
 | BTCS L1 anchor publication | **One-shot regtest publication E2E PASS; data availability PARTIAL** | A signed transaction with one verified batch commitment was mempool-accepted, confirmed at height 305, and its durable publication record survived reopen. The batch body was not published; see docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md. |
 | BTCS L1 deposits and L2 credit | **Deposit-prelude prototype implemented; real regtest E2E PASS** | A 0.1 BTC deposit was verified through trusted local Core RPC, stored durably, credited into the L2 state root, and included in an independently replayed v2 settlement batch. See `docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`. |
-| Deposit reorganization and recovery | **Fail-closed prototype implemented; source attribution remains partial** | Canonical EVM replay tracks native value outflow, fees, and selfdestructs; local recovery freezes, re-derives, and adopts under a cross-process directory lock. Address-level evidence can false-positive among fungible credits; automatic L1 watching and multi-host coordination are not implemented. |
+| Deposit reorganization and recovery | **Fail-closed prototype and polling watcher implemented; source attribution remains partial** | Canonical EVM replay tracks native value outflow, fees, and selfdestructs; local recovery freezes, re-derives, and adopts under a cross-process directory lock. The watcher persists a bounded cursor, reconciles shallow reorgs, and fails closed on deeper reorgs; scheduled operation and multi-host coordination are not implemented. |
 | Production rollup security | **Not delivered** | Trust-minimized custody, withdrawals, forced inclusion, complete data availability and clean-node reconstruction from BTCS data, fraud/validity proof enforcement, and production reorg/accounting guarantees remain open. |
 
 ### Latest verified evidence
 
 In `execution/evm`, Node `v24.17.0` passes `npm run typecheck` and the full
-EVM suite passes **229/229**. The real deposit-to-settlement E2E also passes.
+EVM suite passes **236/236**, including seven deposit-watcher tests. The real deposit-to-settlement E2E also passes.
 Its full result, identifiers, and limits are recorded in
 `docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`.
 
@@ -66,7 +66,7 @@ trustless inclusion, an L1 reorg test, production escrow, or withdrawals.
 
 The current model uses a BTCS transaction containing a `BTCSL2D` OP_RETURN intent that identifies the EVM recipient, alongside a payment to the configured deposit destination. A configured BTCS Core RPC is trusted to report transaction and active-chain details. After the required confirmations, a durable deposit record can be converted into a canonical L2 deposit operation; the operation is committed into L2 block state and protected against duplicate credit in the prototype.
 
-This is **not a trustless bridge**. The current implementation does not itself provide a BTCS SPV/light-client proof, an enforceable production vault, or a withdrawal/exit protocol. It detects address-level outflows conservatively and freezes on a potentially spent invalidated credit; source-specific attribution and automatic reorg watching remain incomplete. The fixed test recipient and regtest amount are fixtures, not production defaults to expose to users.
+This is **not a trustless bridge**. The current implementation does not itself provide a BTCS SPV/light-client proof, an enforceable production vault, or a withdrawal/exit protocol. It detects address-level outflows conservatively and freezes on a potentially spent invalidated credit. The L1 watcher is an operator-scheduled polling component, not a continuously managed service. Source-specific attribution remains incomplete. The fixed test recipient and regtest amount are fixtures, not production defaults to expose to users.
 
 ### Current stage map
 
@@ -75,7 +75,7 @@ This is **not a trustless bridge**. The current implementation does not itself p
 | **1 — EVM execution** | Local prototype broadly tested; pinned-runtime acceptance still outstanding | Run typecheck, full suite, client demo and verifier under Node `24.17.0`; later differential testing and production-engine decision. |
 | **2 — Storage, replay and recovery** | Persistence, canonical replay, checkpoint continuation tested | Define trusted bootstrap from L1-published data; broaden crash/corruption/reorg recovery. |
 | **3 — Settlement envelopes and batches** | Local validation and independent replay tested; deposit settlement passed on regtest | Maintain adversarial coverage; connect publication to L1 and reconstruct published batch data. |
-| **4 — BTCS L1 settlement and deposits** | Deposit-to-settlement and one-shot anchor-publication E2Es PASS; always-on watching and batch-data availability remain incomplete | Add transaction discovery, confirmation/reorg monitoring, and publish/reconstruct complete batch data. |
+| **4 — BTCS L1 settlement and deposits** | Deposit-to-settlement and one-shot anchor-publication E2Es PASS; a bounded deposit watcher is implemented; batch-data availability remains incomplete | Publish and reconstruct complete batch data, then test watcher operation against regtest and define service scheduling/restart behavior. |
 | **5 — Rollup security** | Local recovery is fail-closed; production security mechanisms remain unimplemented | Specify and prototype data availability, forced inclusion, disputes/proofs, withdrawals, and enforceable bridge custody/accounting. |
 | **6 — Production readiness** | Not reached | Independent security review, adversarial testnet, operational recovery drills, monitoring and governance. |
 
@@ -85,11 +85,10 @@ This is **not a trustless bridge**. The current implementation does not itself p
 and the real deposit-to-settlement E2E are saved as `READY_FOR_REVIEW` items in
 `docs/WORK-QUEUE.md`; none is marked `COMPLETE` pending human review.
 
-**Next bounded integration target:** create and implement an L1 deposit watcher
-that discovers configured deposit transactions, tracks confirmations, and
-surfaces confirmed reorgs to the existing fail-closed recovery workflow. Then
-connect the settlement-anchor transaction lifecycle and define/reconstruct the
-batch data required for availability. Keep trusted-Core-RPC, local-filesystem,
+**Next bounded integration target:** define and implement L1 batch-data
+publication and reconstruction. The deposit watcher and one-shot anchor
+publication are saved as `READY_FOR_REVIEW` tasks; the work queue requires human
+review before marking them complete. Keep trusted-Core-RPC, local-filesystem,
 and prototype security boundaries explicit.
 
 **Later gates:** proof/dispute enforcement, forced inclusion, withdrawals, and

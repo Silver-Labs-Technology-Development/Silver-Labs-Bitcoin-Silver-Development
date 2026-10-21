@@ -69,6 +69,21 @@ export class BtcsL1CoreRpcClient implements BtcsL1ConfirmationRpc {
     return this.call('getblockheader', [blockHash, true])
   }
 
+  async getBlockchainInfo(): Promise<unknown> {
+    return this.call('getblockchaininfo', [])
+  }
+
+  async getBlockHash(height: number): Promise<unknown> {
+    if (!Number.isSafeInteger(height) || height < 0) {
+      throw new ProtocolError('BTCS block height must be a non-negative safe integer')
+    }
+    return this.call('getblockhash', [height])
+  }
+
+  async getBlock(blockHash: string): Promise<unknown> {
+    return this.call('getblock', [blockHash, 2])
+  }
+
   private async call(method: string, params: readonly unknown[]): Promise<unknown> {
     const id = this.nextId++
     const headers: Record<string, string> = {
