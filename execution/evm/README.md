@@ -175,6 +175,191 @@ automatic mining, withdrawals or production balance semantics, remote RPC, any
 L1 publication, settlement, or finality, or any production sequencer, rollup,
 proof system, or BTCS settlement client.
 
+<a id="regtest-deposit-settlement-e2e"></a>
+
+## Regtest deposit-to-settlement E2E (`e2e:deposit`)
+
+`npm run e2e:deposit` runs `scripts/regtest-deposit-settlement-e2e.ts`. Unlike
+`demo:client`, it requires a **separately started** BTCS Core regtest node and
+never starts, initializes, or repairs one itself. It exercises the Stage 4 path:
+a real L1 regtest deposit transaction is mined, verified through the local Core
+RPC, recorded durably, credited on a local BTCS L2 chain, and replayed through a
+settlement v2 batch plus an independent re-execution.
+
+### Prerequisites
+
+- A dedicated BTCS Core regtest node running with its own data directory
+  (default `~/.local/share/btcs-l2-deposit-regtest-20261011`).
+- The `bitcoinsilver-cli` binary (default
+  `~/Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilver-cli`) pointed at the
+  same data directory and RPC port the node was started with.
+- A readable RPC cookie at `<datadir>/regtest/.cookie`, which Core writes on
+  startup.
+
+### Environment-variable overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BTCS_CORE_CLI` | `~/Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilver-cli` | CLI binary path |
+| `BTCS_L1_REGTEST_DATADIR` | `~/.local/share/btcs-l2-deposit-regtest-20261011` | Core data directory (must already exist) |
+| `BTCS_L1_RPC_PORT` | `29445` | Core RPC port (integer 1-65535) |
+| `BTCS_L1_RPC_COOKIE_PATH` | `<datadir>/regtest/.cookie` | RPC cookie path |
+
+### Fail-fast, non-destructive preflight
+
+Before the first mining operation or transaction construction, the runner
+checks, in order, that the CLI exists and is executable, the data directory
+already exists (the runner never creates or initializes it), the RPC cookie is
+readable and syntactically valid, the Core RPC is reachable with the configured
+CLI, data directory, and port, and `getblockchaininfo` reports exactly
+`chain=regtest`. Any failure exits nonzero with a concise, actionable message.
+The RPC cookie contents are never printed or logged.
+
+### Start the dedicated node (you run these)
+
+Verify the flags with `bitcoinsilverd -help`; the daemon accepts both `-regtest`
+and `-chain=regtest`. `-fallbackfee` is needed on a fresh regtest node so
+`fundrawtransaction` can estimate a fee:
+
+```sh
+~/Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilverd \
+  -regtest -daemon \
+  -datadir="$HOME/.local/share/btcs-l2-deposit-regtest-20261011" \
+  -rpcport=29445 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
+  -server -fallbackfee=0.0002
+```
+
+Then run the E2E:
+
+```sh
+export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"
+npm run e2e:deposit
+```
+
+### Expected side effects
+
+- Mines 101 regtest blocks to create spendable test coins, broadcasts one
+  regtest deposit transaction, then mines 2 further confirmation blocks.
+- Persists the dedicated Core data directory, the `btcs-l2-deposit-e2e`
+  wallet, and its cookie across runs; the runner does not delete them.
+- Uses a temporary L2 scratch directory for the local chain, deposit store, and
+  replay work and removes it on exit, including on failure.
+- Writes nothing inside the repository.
+
+### Safe shutdown (only the test daemon)
+
+```sh
+~/Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilver-cli \
+  -regtest -datadir="$HOME/.local/share/btcs-l2-deposit-regtest-20261011" \
+  -rpcport=29445 stop
+```
+
+### Unresolved issues
+
+L1 deposit verification uses a trusted local Core RPC; it is not a trustless
+inclusion proof. Automatic, in-place adoption of a re-derived chain and
+automatic attribution of an EVM spend to a specific credit remain **not**
+implemented; see the deposit reorg accounting and recovery sections below. When
+a descendant transaction depended on a removed credit, recovery fails closed and
+the chain store is frozen. Withdrawals, production escrow, and data availability
+are also out of scope.
+
+<a id="deposit-reorg-accounting"></a>
+
+## Deposit reorg accounting (`depositReorgAccounting`)
+
+`src/depositReorgAccounting.ts` specifies and tests the bridge accounting
+invariant `creditedWei <= securedWei` over confirmed L1 deposit records and
+canonical L2 deposit credits, and classifies each timing of an L1 reorg relative
+to L2 credit and spend:
+
+```sh
+npm test   # includes tests/depositReorgAccounting.test.ts
+```
+
+The module is deliberately conservative and honest about its limits:
+
+- `calculateDepositAccounting` reports `unbacked-credit`, `amount-mismatch`,
+  `duplicate-credit`, and `over-credit`; a violation sets `progressBlocked`.
+- `classifyDepositReorg` maps reorg-before-credit to `invalidate-l1-only`,
+  after-credit-before-spend to `revert-l2-credit`, after-spend to
+  `freeze-bridge` (the whitepaper's defined invalid state), and re-inclusion to
+  `no-op` or `credit-l2-once`.
+- `assessCreditSpend` returns `spent` only when the recipient tip balance is
+  below the credited amount, otherwise `unknown`; it never returns `unspent`.
+
+What it does **not** do: it does not re-derive canonical L2 history to remove an
+unbacked credit, does not attribute arbitrary EVM spends to a specific credit,
+and does not make the bridge trustless or production-safe. The after-credit and
+after-spend cases accept an explicit `creditSpent` input and default to the
+conservative freeze. See `docs/DEPOSIT-REORG-ACCOUNTING-v0.1.md`.
+
+<a id="deposit-reorg-recovery"></a>
+
+## Deposit reorg recovery (`depositReorgRecovery`)
+
+`src/depositReorgRecovery.ts` closes the gap left by the accounting module for
+the recoverable case: it re-derives canonical L2 state after one or more credited
+deposits cease to be canonical.
+
+```sh
+npm test   # includes tests/depositReorgRecovery.test.ts
+```
+
+`rederiveCanonicalL2AfterDepositInvalidation({ canonicalView, invalidatedDepositIds, outputDirectory })`:
+
+1. Replays the untouched canonical prefix (heights before the earliest
+   invalidated credit) into a fresh store with `PersistentBlockProcessor.acceptBlock`.
+2. Rebuilds every block from that height through the tip with
+   `buildNextBlock`, removing only the invalidated deposit operations.
+3. Verifies no invalidated credit remains in the re-derived chain.
+
+It uses only the existing, verified block import and production primitives, so
+the re-derived chain is subject to the same header/state-root/execution checks
+as the canonical chain. It never mutates the source store.
+
+### Fail-closed behavior
+
+If a rebuilt block can no longer execute — typically because a later transaction
+spent the removed credit — re-derivation throws a typed
+`DepositReorgRecoveryError` (`rebuild-failed`, `residual-credit`, or
+`output-directory-not-usable`) and the partial output store is removed. No
+replacement chain is fabricated.
+
+recoverDepositReorg({ processor, invalidatedDepositIds, outputDirectory })
+coordinates operator recovery under the source processor's exclusive operation
+queue. It captures a fresh canonical view while holding the same queue used by
+buildNextBlock and acceptBlock. When a requested deposit is credited, it writes
+the fail-closed gate before releasing the queue, then attempts re-derivation.
+An extension already in progress finishes first and is included in the view;
+queued extensions wait and then observe the gate. This synchronization is
+in-process and scoped to one processor instance; independent processes sharing
+a chain directory are not coordinated.
+
+### Enforced gate
+
+The gate is enforced in both public canonical tip-advancing entry points of
+`PersistentBlockProcessor`: `buildNextBlock` (including the RPC `btcs_dev_mine` →
+`DevelopmentSequencer` path) and the `acceptBlock` block-import path. The private
+`appendBlockUnlocked` primitive they share is reachable only through those gated
+methods, so there is no ordinary way to extend a frozen store. While frozen, both
+methods throw `DepositRecoveryGateError`, and the freeze persists across a
+process reopen. An invalid or unreadable gate marker fails closed on both paths.
+
+Gating `acceptBlock` does not block legitimate replay: settlement verification,
+the E2E independent replay, and this module's re-derivation all import into a
+separate fresh store, which has no gate marker and is therefore open. The
+operator recovery flow copies verified re-derived records into the frozen
+source, commits the new canonical tip by atomically replacing `chain.json`, and
+clears the gate only after that commit. A pre-commit failure leaves the previous
+tip frozen and the candidate store available for retry. Recovery coordination
+is in-process and scoped to one processor instance; independent processes
+sharing a chain directory are not coordinated.
+
+**Still partial:** automatic attribution of an EVM spend to a specific credit,
+cross-process recovery coordination, and any network/L1 action. See
+`docs/DEPOSIT-REORG-RECOVERY-v0.1.md`.
+
 ## Fixed execution assumptions
 
 - Genesis allocates `10,000` native units (18 decimals) to one deterministic, test-only private key (`0x11` repeated 32 bytes). This key is public test data and must never hold real assets.

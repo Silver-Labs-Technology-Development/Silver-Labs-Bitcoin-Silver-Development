@@ -38,6 +38,11 @@ import {
   verifyEvmDepositPrelude,
   type EvmDepositOperation,
 } from './depositPrelude.js'
+import {
+  assertDepositRecoveryOpen,
+  clearDepositRecoveryGate,
+  readDepositRecoveryGate,
+} from './depositRecoveryGate.js'
 
 export const LOCAL_CHAIN_PROFILE = 'btcs-l2-local-v0.12-deposit-prelude'
 export const STORE_SCHEMA_VERSION = 2
@@ -1165,6 +1170,76 @@ export class PersistentBlockProcessor {
     }
   }
 
+  /**
+   * Run recovery while holding the same exclusive queue as canonical block
+   * extensions. The view is captured only after earlier extensions complete.
+   * The callback must not extend this processor; recovery writes the gate before
+   * it releases the queue so later extensions observe the freeze.
+   */
+  async withDepositRecoveryLock<T>(
+    operation: (canonicalView: CanonicalReadView) => Promise<T>,
+  ): Promise<T> {
+    return this.withExclusiveOperation(async () =>
+      operation(await this.createCanonicalReadView()),
+    )
+  }
+
+  /**
+   * Adopt a fully replay-verified re-derived store while the canonical source
+   * remains frozen. Block records are copied first; the atomic chain metadata
+   * update is the commit point. The recovery gate is removed only after commit.
+   */
+  async adoptReDerivedStore(reDerivedDirectory: string): Promise<ChainTip> {
+    return this.withExclusiveOperation(async () => {
+      const gate = await readDepositRecoveryGate(this.directory)
+      if (gate === undefined) {
+        throw new ProtocolError('cannot adopt a re-derived store without a frozen recovery gate')
+      }
+
+      const sourceDirectory = resolve(reDerivedDirectory)
+      if (sourceDirectory === this.directory) {
+        throw new ProtocolError('re-derived store must be separate from the canonical store')
+      }
+      await assertDepositRecoveryOpen(sourceDirectory)
+
+      // Opening replays and validates the complete candidate before it can be
+      // installed. The source records remain content-addressed and immutable.
+      const candidate = await PersistentBlockProcessor.open(sourceDirectory)
+      if (candidate.genesisHashValue !== this.genesisHashValue) {
+        throw new ProtocolError('re-derived store genesis does not match the canonical store')
+      }
+      const records = await candidate.loadCanonicalRecords()
+      for (const { record } of records) {
+        await persistContentAddressedRecord(
+          blockRecordPath(this.blocksDirectory, record.blockHash),
+          record,
+          this.persistenceTestHook,
+        )
+      }
+
+      const adoptedTip = { ...candidate.tipValue }
+      const metadata = newMetadata(candidate.genesisHashValue, adoptedTip)
+      try {
+        await atomicWrite(
+          resolve(this.directory, 'chain.json'),
+          encodeJson(metadata),
+          'tip',
+          this.persistenceTestHook,
+        )
+      } catch (error) {
+        // The atomic rename may have committed even if a later durability hook
+        // failed. Reconcile memory with whichever metadata is now on disk.
+        await this.reconcileTipAfterFailedWrite(adoptedTip)
+        throw error
+      }
+
+      this.genesisHashValue = candidate.genesisHashValue
+      this.tipValue = adoptedTip
+      await clearDepositRecoveryGate(this.directory)
+      return { ...adoptedTip }
+    })
+  }
+
   async buildNextBlock(
     transactions: readonly TypedTransaction[],
     timestamp: bigint,
@@ -1175,6 +1250,7 @@ export class PersistentBlockProcessor {
       ...normalizeEvmDepositOperations(depositOperations),
     ]
     return this.withExclusiveOperation(async () => {
+      await assertDepositRecoveryOpen(this.directory)
       const session = await this.replayCanonical()
       const parent = session.blocks.at(-1)
       if (parent === undefined) throw new ProtocolError('canonical chain is missing genesis')
@@ -1228,16 +1304,25 @@ export class PersistentBlockProcessor {
     })
   }
 
+  /**
+   * Import a block built elsewhere and append it to the canonical chain.
+   *
+   * Like {@link buildNextBlock}, this advances the canonical tip, so it is
+   * refused on a frozen deposit-recovery store. Isolated historical replay and
+   * recovery reconstruction must import into a separate, fresh store, which has
+   * no gate marker and is therefore open.
+   */
   async acceptBlock(
     blockRlp: Uint8Array,
     depositOperations: readonly EvmDepositOperation[] = [],
   ): Promise<ProcessedBlock> {
-    return this.withExclusiveOperation(() =>
-      this.appendBlockUnlocked(
+    return this.withExclusiveOperation(async () => {
+      await assertDepositRecoveryOpen(this.directory)
+      return this.appendBlockUnlocked(
         new Uint8Array(blockRlp),
         depositOperations,
-      ),
-    )
+      )
+    })
   }
 
   async replay(): Promise<ReplayReport> {

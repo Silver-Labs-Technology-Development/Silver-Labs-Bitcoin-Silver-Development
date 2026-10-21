@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { constants } from 'node:fs'
+import { access, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { pathToFileURL } from 'node:url'
 import { Address, hexToBytes, unprefixedHexToBytes } from '@ethereumjs/util'
 
 import {
@@ -35,20 +37,76 @@ import {
   verifyEvmSettlementBatchExecution,
 } from '../src/settlementBatchReplay.js'
 
-const CLI_PATH =
-  process.env.BTCS_CORE_CLI ??
-  join(process.env.HOME ?? '', 'Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilver-cli')
-
-const DATADIR =
-  process.env.BTCS_L1_REGTEST_DATADIR ??
-  join(process.env.HOME ?? '', '.local/share/btcs-l2-deposit-regtest-20261011')
-
-const RPC_PORT = process.env.BTCS_L1_RPC_PORT ?? '29445'
-const COOKIE_PATH =
-  process.env.BTCS_L1_RPC_COOKIE_PATH ??
-  join(DATADIR, 'regtest', '.cookie')
-
 const WALLET_NAME = 'btcs-l2-deposit-e2e'
+
+export class PreflightError extends Error {
+  constructor(message: string) {
+    super(`Preflight failed: ${message}`)
+    this.name = 'PreflightError'
+  }
+}
+
+export type E2EConfig = Readonly<{
+  cliPath: string
+  dataDir: string
+  rpcPort: string
+  cookiePath: string
+}>
+
+export type CoreChainInfo = Readonly<{
+  chain: string
+  blocks: number
+  bestblockhash: string
+}>
+
+export type PreflightDependencies = Readonly<{
+  readChainInfo?: (config: E2EConfig) => CoreChainInfo
+}>
+
+export function resolveE2EConfig(env: NodeJS.ProcessEnv): E2EConfig {
+  const home = env.HOME ?? ''
+  if (home === '') {
+    throw new PreflightError(
+      'HOME must be set so the dedicated regtest paths can be resolved',
+    )
+  }
+
+  const cliPath =
+    env.BTCS_CORE_CLI ??
+    join(home, 'Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilver-cli')
+  if (cliPath === '') {
+    throw new PreflightError('BTCS_CORE_CLI must not be empty')
+  }
+
+  const dataDir =
+    env.BTCS_L1_REGTEST_DATADIR ??
+    join(home, '.local/share/btcs-l2-deposit-regtest-20261011')
+  if (dataDir === '') {
+    throw new PreflightError('BTCS_L1_REGTEST_DATADIR must not be empty')
+  }
+
+  const rpcPort = env.BTCS_L1_RPC_PORT ?? '29445'
+  if (
+    !/^\d+$/.test(rpcPort) ||
+    Number(rpcPort) < 1 ||
+    Number(rpcPort) > 65535
+  ) {
+    throw new PreflightError(
+      `BTCS_L1_RPC_PORT must be a TCP port between 1 and 65535 ` +
+      `(received ${JSON.stringify(rpcPort)})`,
+    )
+  }
+
+  const cookiePath =
+    env.BTCS_L1_RPC_COOKIE_PATH ??
+    join(dataDir, 'regtest', '.cookie')
+  if (cookiePath === '') {
+    throw new PreflightError('BTCS_L1_RPC_COOKIE_PATH must not be empty')
+  }
+
+  return { cliPath, dataDir, rpcPort, cookiePath }
+}
+
 const REQUIRED_CONFIRMATIONS = 2
 const DEPOSIT_AMOUNT_BTC = 0.1
 const RECIPIENT_ADDRESS = `0x${'1'.repeat(40)}`
@@ -72,14 +130,15 @@ function errorText(error: unknown): string {
 }
 
 function coreCli(
+  config: E2EConfig,
   method: string,
   params: readonly string[] = [],
   wallet?: string,
 ): string {
   const args = [
     '-regtest',
-    `-datadir=${DATADIR}`,
-    `-rpcport=${RPC_PORT}`,
+    `-datadir=${config.dataDir}`,
+    `-rpcport=${config.rpcPort}`,
   ]
 
   if (wallet !== undefined) {
@@ -89,7 +148,7 @@ function coreCli(
   args.push(method, ...params)
 
   try {
-    return execFileSync(CLI_PATH, args, {
+    return execFileSync(config.cliPath, args, {
       encoding: 'utf8',
       timeout: 120_000,
       maxBuffer: 16 * 1024 * 1024,
@@ -101,11 +160,12 @@ function coreCli(
 }
 
 function coreCliJson<T>(
+  config: E2EConfig,
   method: string,
   params: readonly string[] = [],
   wallet?: string,
 ): T {
-  const output = coreCli(method, params, wallet)
+  const output = coreCli(config, method, params, wallet)
   try {
     return JSON.parse(output) as T
   } catch {
@@ -113,19 +173,19 @@ function coreCliJson<T>(
   }
 }
 
-async function ensureWallet(): Promise<void> {
-  const loaded = coreCliJson<string[]>('listwallets')
+async function ensureWallet(config: E2EConfig): Promise<void> {
+  const loaded = coreCliJson<string[]>(config, 'listwallets')
   if (loaded.includes(WALLET_NAME)) {
     console.log(`Wallet ready: ${WALLET_NAME}`)
     return
   }
 
   try {
-    coreCli('loadwallet', [WALLET_NAME])
+    coreCli(config, 'loadwallet', [WALLET_NAME])
     console.log(`Loaded existing wallet: ${WALLET_NAME}`)
   } catch (loadError) {
     try {
-      coreCli('createwallet', [WALLET_NAME])
+      coreCli(config, 'createwallet', [WALLET_NAME])
       console.log(`Created wallet: ${WALLET_NAME}`)
     } catch (createError) {
       throw new Error(
@@ -136,24 +196,19 @@ async function ensureWallet(): Promise<void> {
     }
   }
 
-  const nowLoaded = coreCliJson<string[]>('listwallets')
+  const nowLoaded = coreCliJson<string[]>(config, 'listwallets')
   assert.ok(nowLoaded.includes(WALLET_NAME), 'test wallet must be loaded')
 }
 
-async function readRpcCookie(): Promise<{ username: string; password: string }> {
-  let cookie: string
-  try {
-    cookie = (await readFile(COOKIE_PATH, 'utf8')).trim()
-  } catch {
-    throw new Error(
-      `Cannot read the local RPC cookie at ${COOKIE_PATH}. ` +
-      `Set BTCS_L1_RPC_COOKIE_PATH if this node stores it elsewhere.`,
+export function parseRpcCookie(raw: string): { username: string; password: string } {
+  const cookie = raw.trim()
+  const separator = cookie.indexOf(':')
+  if (separator <= 0 || separator >= cookie.length - 1) {
+    throw new PreflightError(
+      'RPC cookie is malformed; expected a non-empty user and password ' +
+      'separated by a colon',
     )
   }
-
-  const separator = cookie.indexOf(':')
-  assert.ok(separator > 0 && separator < cookie.length - 1,
-    'RPC cookie must contain a username and password separated by a colon')
 
   return {
     username: cookie.slice(0, separator),
@@ -161,31 +216,106 @@ async function readRpcCookie(): Promise<{ username: string; password: string }> 
   }
 }
 
+export async function readRpcCookie(
+  cookiePath: string,
+): Promise<{ username: string; password: string }> {
+  let raw: string
+  try {
+    raw = await readFile(cookiePath, 'utf8')
+  } catch {
+    throw new PreflightError(
+      `cannot read the local RPC cookie at ${cookiePath}. ` +
+      `Set BTCS_L1_RPC_COOKIE_PATH if this node stores it elsewhere.`,
+    )
+  }
+
+  return parseRpcCookie(raw)
+}
+
+export async function assertCliExecutable(cliPath: string): Promise<void> {
+  const info = await stat(cliPath).catch(() => undefined)
+  if (info === undefined) {
+    throw new PreflightError(
+      `BTCS Core CLI not found at ${cliPath}. ` +
+      `Set BTCS_CORE_CLI to the bitcoinsilver-cli path.`,
+    )
+  }
+  if (!info.isFile()) {
+    throw new PreflightError(
+      `BTCS Core CLI path ${cliPath} is not a regular file.`,
+    )
+  }
+
+  const executable = await access(cliPath, constants.X_OK).then(
+    () => true,
+    () => false,
+  )
+  if (!executable) {
+    throw new PreflightError(
+      `BTCS Core CLI at ${cliPath} is not executable. ` +
+      `Fix its permissions or point BTCS_CORE_CLI elsewhere.`,
+    )
+  }
+}
+
+export async function assertDataDirectory(dataDir: string): Promise<void> {
+  const info = await stat(dataDir).catch(() => undefined)
+  if (info === undefined) {
+    throw new PreflightError(
+      `regtest data directory ${dataDir} does not exist. Start the dedicated ` +
+      `node for that directory or set BTCS_L1_REGTEST_DATADIR; this runner ` +
+      `never creates or initializes it.`,
+    )
+  }
+  if (!info.isDirectory()) {
+    throw new PreflightError(
+      `regtest data directory ${dataDir} is not a directory.`,
+    )
+  }
+}
+
+export async function preflight(
+  config: E2EConfig,
+  dependencies: PreflightDependencies = {},
+): Promise<CoreChainInfo> {
+  await assertCliExecutable(config.cliPath)
+  await assertDataDirectory(config.dataDir)
+  await readRpcCookie(config.cookiePath)
+
+  let chainInfo: CoreChainInfo
+  try {
+    chainInfo =
+      dependencies.readChainInfo !== undefined
+        ? dependencies.readChainInfo(config)
+        : coreCliJson<CoreChainInfo>(config, 'getblockchaininfo')
+  } catch (error) {
+    if (error instanceof PreflightError) {
+      throw error
+    }
+    throw new PreflightError(
+      `BTCS Core RPC is unreachable at 127.0.0.1:${config.rpcPort} using ` +
+      `${config.cliPath} and data directory ${config.dataDir}. Start the ` +
+      `dedicated node for that directory or check the port. ` +
+      `Detail: ${errorText(error)}`,
+    )
+  }
+
+  if (chainInfo.chain !== 'regtest') {
+    throw new PreflightError(
+      `refusing to run: Core reports chain=${JSON.stringify(chainInfo.chain)}, ` +
+      `but this end-to-end test requires chain=regtest.`,
+    )
+  }
+
+  return chainInfo
+}
+
 async function main(): Promise<void> {
-  assert.ok(
-    process.env.HOME,
-    'HOME must be set so the dedicated regtest paths can be resolved',
-  )
-  assert.ok(
-    /^\d+$/.test(RPC_PORT) &&
-    Number(RPC_PORT) >= 1 &&
-    Number(RPC_PORT) <= 65535,
-    'BTCS_L1_RPC_PORT must be a valid TCP port',
-  )
+  const config = resolveE2EConfig(process.env)
 
-  console.log('1/9 Checking the dedicated BTCS regtest node')
+  console.log('1/9 Preflighting the dedicated BTCS regtest node')
 
-  const chainInfo = coreCliJson<{
-    chain: string
-    blocks: number
-    bestblockhash: string
-  }>('getblockchaininfo')
-
-  assert.equal(
-    chainInfo.chain,
-    'regtest',
-    'Refusing to run unless the selected Core node reports chain=regtest',
-  )
+  const chainInfo = await preflight(config)
 
   console.log(JSON.stringify({
     chain: chainInfo.chain,
@@ -194,18 +324,20 @@ async function main(): Promise<void> {
   }, null, 2))
 
   console.log('2/9 Preparing the dedicated regtest wallet')
-  await ensureWallet()
+  await ensureWallet(config)
 
   const minerAddress = coreCli(
+    config,
     'getnewaddress',
     [],
     WALLET_NAME,
   )
 
   console.log('3/9 Mining 101 local regtest blocks for spendable test funds')
-  coreCliJson<string[]>('generatetoaddress', ['101', minerAddress])
+  coreCliJson<string[]>(config, 'generatetoaddress', ['101', minerAddress])
 
   const depositAddress = coreCli(
+    config,
     'getnewaddress',
     [],
     WALLET_NAME,
@@ -213,7 +345,7 @@ async function main(): Promise<void> {
 
   const addressInfo = coreCliJson<{
     scriptPubKey?: unknown
-  }>('getaddressinfo', [depositAddress], WALLET_NAME)
+  }>(config, 'getaddressinfo', [depositAddress], WALLET_NAME)
 
   assert.equal(typeof addressInfo.scriptPubKey, 'string')
   const depositScriptPubKeyHex = (
@@ -236,6 +368,7 @@ async function main(): Promise<void> {
   ]
 
   const unsigned = coreCli(
+    config,
     'createrawtransaction',
     [
       JSON.stringify([]),
@@ -246,6 +379,7 @@ async function main(): Promise<void> {
   assert.ok(unsigned.length > 0, 'unsigned transaction must contain hex')
 
   const funded = coreCliJson<{ hex: string }>(
+    config,
     'fundrawtransaction',
     [unsigned],
     WALLET_NAME,
@@ -257,6 +391,7 @@ async function main(): Promise<void> {
     hex: string
     complete: boolean
   }>(
+    config,
     'signrawtransactionwithwallet',
     [funded.hex],
     WALLET_NAME,
@@ -265,7 +400,7 @@ async function main(): Promise<void> {
   assert.equal(signed.complete, true, 'regtest transaction must be fully signed')
   assert.ok(signed.hex.length > 0)
 
-  const txid = coreCli('sendrawtransaction', [signed.hex])
+  const txid = coreCli(config, 'sendrawtransaction', [signed.hex])
   assert.match(txid, /^[0-9a-f]{64}$/)
 
   console.log(`Broadcast local regtest transaction: ${txid}`)
@@ -273,6 +408,7 @@ async function main(): Promise<void> {
   console.log('5/9 Mining confirmations and locating actual transaction inclusion')
 
   const minedHashes = coreCliJson<string[]>(
+    config,
     'generatetoaddress',
     ['2', minerAddress],
   )
@@ -284,7 +420,7 @@ async function main(): Promise<void> {
       hash?: string
       height?: number
       tx?: unknown
-    }>('getblock', [hash, '1'])
+    }>(config, 'getblock', [hash, '1'])
 
     if (
       Array.isArray(block.tx) &&
@@ -305,6 +441,7 @@ async function main(): Promise<void> {
     height: number
     confirmations: number
   }>(
+    config,
     'getblockheader',
     [inclusionBlockHash, 'true'],
   )
@@ -322,10 +459,10 @@ async function main(): Promise<void> {
 
   console.log('6/9 Verifying the L1 deposit using the project RPC verifier')
 
-  const credentials = await readRpcCookie()
+  const credentials = await readRpcCookie(config.cookiePath)
 
   const rpc = new BtcsL1CoreRpcClient({
-    url: `http://127.0.0.1:${RPC_PORT}`,
+    url: `http://127.0.0.1:${config.rpcPort}`,
     username: credentials.username,
     password: credentials.password,
     timeoutMs: 10_000,
@@ -556,8 +693,14 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  console.error('FAIL: BTCS regtest deposit-settlement demo')
-  console.error(errorText(error))
-  process.exitCode = 1
-})
+const isDirectExecution =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+
+if (isDirectExecution) {
+  main().catch((error: unknown) => {
+    console.error('FAIL: BTCS regtest deposit-settlement demo')
+    console.error(errorText(error))
+    process.exitCode = 1
+  })
+}

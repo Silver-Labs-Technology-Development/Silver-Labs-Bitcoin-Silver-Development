@@ -13,6 +13,7 @@
     "rpc": "tsx src/rpcServer.ts",
     "demo": "tsx src/demo.ts",
     "demo:client": "tsx scripts/demo-client.ts",
+    "e2e:deposit": "tsx scripts/regtest-deposit-settlement-e2e.ts",
     "verify:batch": "tsx scripts/verify-settlement-batch.ts",
     "verify:batch:execution": "tsx scripts/verify-settlement-batch-execution.ts"
   },
