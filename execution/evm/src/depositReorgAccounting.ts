@@ -1,5 +1,9 @@
 import { Address, unprefixedHexToBytes } from '@ethereumjs/util'
-import { ProtocolError, type CanonicalReadView } from './blockProcessor.js'
+import {
+  ProtocolError,
+  type CanonicalReadView,
+  type CanonicalSpendActivity,
+} from './blockProcessor.js'
 import type { BtcsL1DepositRecord } from './btcsL1DepositStore.js'
 
 export const DEPOSIT_ACCOUNTING_FORMAT = 'btcs-l2-deposit-accounting'
@@ -83,6 +87,18 @@ export type DepositReorgPlan = Readonly<{
   /** Present only for `revert-l2-credit`: re-derive canonical L2 from this height. */
   rederiveFromBlock?: string
   reason: string
+}>
+
+export type CreditSpendAssessment = Readonly<{
+  status: 'outflow-observed' | 'no-outflow-observed' | 'unknown'
+  basis: 'canonical-execution-trace' | 'balance-floor' | 'incomplete-trace'
+  /** Address-level evidence; fungibility means this is deliberately conservative. */
+  activity?: CanonicalSpendActivity
+}>
+
+export type CanonicalDepositReorgClassification = Readonly<{
+  plan: DepositReorgPlan
+  spendAssessment?: CreditSpendAssessment
 }>
 
 function requireUint(value: unknown, label: string): string {
@@ -249,9 +265,9 @@ export function calculateDepositAccounting(input: Readonly<{
 
 /**
  * Classify the reorg timing of one deposit and return the deterministic
- * remediation. `creditSpent` must be supplied by the caller's L2 accounting;
- * this prototype cannot attribute arbitrary EVM spends to a specific credit
- * without transaction-level tracing, which is not implemented.
+ * remediation. `creditSpent` is a conservative risk flag supplied by the caller;
+ * use `classifyCanonicalDepositReorg` to derive it from replay evidence, with
+ * unknown spend status treated as potentially spent.
  */
 export function classifyDepositReorg(input: Readonly<{
   depositId: string
@@ -308,7 +324,7 @@ export function classifyDepositReorg(input: Readonly<{
       action: 'freeze-bridge',
       progressBlocked: true,
       reason:
-        'L1 deposit was reorganized out after its L2 credit was spent; unwinding requires unproven L2 re-derivation',
+        'L1 deposit was reorganized out after observed or unexcluded post-credit outflow; unwinding requires unproven L2 re-derivation',
     }
   }
 
@@ -326,18 +342,72 @@ export function classifyDepositReorg(input: Readonly<{
 }
 
 /**
- * Sound, partial spend evidence for one L2 credit. Returns `spent` only when the
- * recipient balance at the canonical tip is below the credited amount, which
- * proves at least part of the credit left the account. Returns `unknown`
- * otherwise: because balance is fungible, a sufficient balance cannot prove the
- * credit was not spent. Never returns `unspent`.
+ * Classify a deposit against a replay-verified canonical L2 view. Any observed
+ * outflow or incomplete spend trace is treated as potentially spent, so an
+ * unbacked credit freezes progression unless the complete trace proves that no
+ * outflow followed the credit.
+ */
+export async function classifyCanonicalDepositReorg(input: Readonly<{
+  depositId: string
+  view: CanonicalReadView
+  l1: BtcsL1DepositRecord | undefined
+  credit: DepositCredit | undefined
+}>): Promise<CanonicalDepositReorgClassification> {
+  if (input.credit === undefined) {
+    return {
+      plan: classifyDepositReorg({
+        depositId: input.depositId,
+        l1: input.l1,
+        credit: undefined,
+        creditSpent: false,
+      }),
+    }
+  }
+  if (input.credit.depositId !== input.depositId) {
+    throw new ProtocolError('deposit ID does not match the canonical credit')
+  }
+  const spendAssessment = await assessCreditSpend(input.view, input.credit)
+  return {
+    plan: classifyDepositReorg({
+      depositId: input.credit.depositId,
+      l1: input.l1,
+      credit: input.credit,
+      creditSpent: spendAssessment.status !== 'no-outflow-observed',
+    }),
+    spendAssessment,
+  }
+}
+
+/**
+ * Assess address-level native-asset outflow since a canonical credit. A complete
+ * replay trace observes top-level and nested value transfers, transaction fees,
+ * and selfdestructs. Because native balances are fungible, any such activity is
+ * conservatively treated as a possible spend of every earlier credit to that
+ * address; this can freeze recovery even when pre-existing funds covered it.
  */
 export async function assessCreditSpend(
   view: CanonicalReadView,
   credit: DepositCredit,
-): Promise<'spent' | 'unknown'> {
+): Promise<CreditSpendAssessment> {
   const validated = commit([credit])[0]!
   const address = new Address(unprefixedHexToBytes(validated.recipientAddress.slice(2)))
+  const activity = view.getSpendActivitySince(
+    validated.recipientAddress,
+    BigInt(validated.creditedAtBlock),
+  )
+  if (activity !== undefined) {
+    return {
+      status: 'outflow-observed',
+      basis: 'canonical-execution-trace',
+      activity,
+    }
+  }
+  if (view.spendTraceComplete) {
+    return { status: 'no-outflow-observed', basis: 'canonical-execution-trace' }
+  }
   const tipBalance = await view.getAccountBalance(address)
-  return tipBalance < BigInt(validated.amountWei) ? 'spent' : 'unknown'
+  if (tipBalance < BigInt(validated.amountWei)) {
+    return { status: 'outflow-observed', basis: 'balance-floor' }
+  }
+  return { status: 'unknown', basis: 'incomplete-trace' }
 }

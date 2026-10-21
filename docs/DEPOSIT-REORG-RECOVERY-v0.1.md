@@ -1,7 +1,8 @@
 # BTCS L2 — Deposit Reorg Recovery (v0.1)
 
-Status: **PROTOTYPE — canonical re-derivation IMPLEMENTED and tested; adoption and
-spend attribution PARTIAL**.
+Status: **PROTOTYPE — canonical re-derivation, adoption, and conservative
+address-level spend evidence IMPLEMENTED and tested; cross-process coordination
+PARTIAL**.
 Task: `BTCS-L2-SECURITY-002` (see `docs/WORK-QUEUE.md`).
 Source: `execution/evm/src/depositReorgRecovery.ts`,
 `execution/evm/src/depositRecoveryGate.ts`,
@@ -26,7 +27,7 @@ In scope:
 
 Out of scope (not implemented here, do not assume):
 
-- Attributing an EVM spend to a specific credit (still requires tracing).
+- Proving that a fungible outflow was funded by one specific credit.
 - Coordinating recovery across independent OS processes sharing one store.
 - Any L1 write, broadcast, signature, or protocol/consensus change.
 - A trustless L1 inclusion proof (verification still uses a trusted local Core
@@ -147,16 +148,16 @@ Proves (by tests, no BTCS Core required):
 
 Does **not** prove:
 
-- Complete spend attribution (a spend that still leaves enough balance is not
-  detected; the fail-closed path only triggers when execution actually breaks).
+- Source-specific attribution among fungible native-asset credits. SECURITY-005
+  traces address outflows, fees, and selfdestructs; an outflow is treated as
+  potentially spent even when unrelated funds could have covered it.
+- Cross-process safety for multiple writers sharing one chain directory.
 - Any production bridge, vault, withdrawal, or proof security.
 
 ## 7. Follow-up
 
-1. Implement transaction-trace spend attribution so `after-spend` can be
-   classified precisely rather than falling out of `rebuild-failed`.
+1. Coordinate the recovery gate and canonical writes across independent OS
+   processes before sharing a chain directory.
 2. Extend the gate to the settlement/production paths beyond block extension if a
    running settlement service is added.
-3. Coordinate the recovery gate across independent processes before sharing a
-   chain directory across processes.
-4. Add a multi-implementation convergence test (whitepaper §49 acceptance).
+3. Add a multi-implementation convergence test (whitepaper §49 acceptance).

@@ -20,7 +20,7 @@ import {
   unprefixedHexToBytes,
 } from '@ethereumjs/util'
 import { getActivePrecompiles } from '@ethereumjs/evm'
-import type { EVMMockBlockchainInterface } from '@ethereumjs/evm'
+import type { EVMResult, EVMMockBlockchainInterface, Message } from '@ethereumjs/evm'
 import { buildBlock, createVM, encodeReceipt, runBlock } from '@ethereumjs/vm'
 import type { RunBlockResult, RunTxResult } from '@ethereumjs/vm'
 import { createStateCheckpoint, openDurableStateManager } from './stateCheckpoint.js'
@@ -185,8 +185,18 @@ type ReplaySession = {
   common: ReturnType<typeof createHarnessCommon>
   blocks: Block[]
   records: Array<{ block: Block; record: BlockRecord }>
+  spendActivityByAddress: Map<string, CanonicalSpendActivity>
+  spendTraceComplete: boolean
   report: ReplayReport
 }
+
+export type CanonicalSpendActivity = Readonly<{
+  blockNumber: bigint
+  transactionIndex?: number
+  transactionHash?: string
+  kind: 'native-value' | 'transaction-fee' | 'selfdestruct'
+  amountWei?: string
+}>
 
 /**
  * A request-scoped view of one fully replayed canonical chain snapshot.
@@ -199,6 +209,31 @@ export class CanonicalReadView {
 
   get report(): ReplayReport {
     return this.session.report
+  }
+
+  /**
+   * Return the latest replay-observed native-value outflow, fee payment, or
+   * selfdestruct by an address at or after the block where its deposit credit
+   * was applied. This is conservative address-level evidence: EVM balances are
+   * fungible, so it does not claim which individual credit funded the outflow.
+   */
+  getSpendActivitySince(
+    address: string,
+    creditedAtBlock: bigint,
+  ): CanonicalSpendActivity | undefined {
+    if (creditedAtBlock < 0n || creditedAtBlock > this.session.report.tip.number) {
+      throw new ProtocolError('credit block is outside canonical history')
+    }
+    const normalizedAddress = lowerHex(address, 'spend recipient address', 20)
+    const activity = this.session.spendActivityByAddress.get(normalizedAddress)
+    return activity !== undefined && activity.blockNumber >= creditedAtBlock
+      ? { ...activity }
+      : undefined
+  }
+
+  /** True only when every canonical block's transaction execution was traced. */
+  get spendTraceComplete(): boolean {
+    return this.session.spendTraceComplete
   }
 
   getCanonicalBlockByNumber(blockNumber: bigint): CanonicalBlockData | undefined {
@@ -1627,6 +1662,8 @@ export class PersistentBlockProcessor {
 
     const summaries: BlockSummary[] = [blockSummary(genesisSession.genesis, [])]
     const seenDepositIds = new Set<string>()
+    const spendActivityByAddress = new Map<string, CanonicalSpendActivity>()
+    let spendTraceComplete = true
     let parent = genesisSession.genesis
     for (let index = 1; index < records.length; index++) {
       const item = records[index]
@@ -1644,7 +1681,77 @@ export class PersistentBlockProcessor {
         block.header.baseFeePerGas!,
       )
       let result: RunBlockResult
+      let topLevelMessageCount = 0
+      const messageStack: Array<{ transactionIndex: number; message: Message }> = []
+      const recordSpendActivity = (
+        address: string,
+        transactionIndex: number,
+        kind: CanonicalSpendActivity['kind'],
+        amountWei?: bigint,
+      ): void => {
+        const normalizedAddress = address.toLowerCase()
+        if (!/^0x[0-9a-f]{40}$/.test(normalizedAddress)) {
+          spendTraceComplete = false
+          return
+        }
+        const tx = transactionIndex >= 0
+          ? block.transactions[transactionIndex]
+          : undefined
+        const activity: CanonicalSpendActivity = {
+          blockNumber: block.header.number,
+          ...(tx === undefined ? {} : {
+            transactionIndex,
+            transactionHash: asBytesHex(tx.hash()),
+          }),
+          kind,
+          ...(amountWei === undefined ? {} : { amountWei: amountWei.toString(10) }),
+        }
+        const previous = spendActivityByAddress.get(normalizedAddress)
+        const previousIndex = previous?.transactionIndex ?? -1
+        if (
+          previous === undefined ||
+          previous.blockNumber < activity.blockNumber ||
+          (previous.blockNumber === activity.blockNumber && previousIndex < transactionIndex)
+        ) {
+          spendActivityByAddress.set(normalizedAddress, activity)
+        }
+      }
+      const events = genesisSession.vm.evm.events
+      const onBeforeMessage = (message: Message): void => {
+        const transactionIndex = message.depth === 0
+          ? topLevelMessageCount++
+          : messageStack.at(-1)?.transactionIndex ?? -1
+        messageStack.push({ transactionIndex, message })
+      }
+      const onAfterMessage = (event: EVMResult, resolve?: (result?: any) => void): void => {
+        const frame = messageStack.pop()
+        if (frame === undefined) {
+          spendTraceComplete = false
+          resolve?.()
+          return
+        }
+        if (event.execResult.exceptionError === undefined) {
+          if (frame.message.value > 0n && !frame.message.delegatecall) {
+            recordSpendActivity(
+              frame.message.caller.toString(),
+              frame.transactionIndex,
+              'native-value',
+              frame.message.value,
+            )
+          }
+          for (const address of event.execResult.selfdestruct?.keys() ?? []) {
+            recordSpendActivity(address, frame.transactionIndex, 'selfdestruct')
+          }
+        }
+        resolve?.()
+      }
       try {
+        if (events === undefined) {
+          spendTraceComplete = false
+        } else {
+          events.on('beforeMessage', onBeforeMessage)
+          events.on('afterMessage', onAfterMessage)
+        }
         await applyEvmDepositOperations(
           genesisSession.vm,
           verifiedDepositOperations,
@@ -1659,6 +1766,31 @@ export class PersistentBlockProcessor {
         })
       } catch (error) {
         throw new ProtocolError(`replay failed at block ${block.header.number}: ${messageOf(error)}`)
+      } finally {
+        events?.off('beforeMessage', onBeforeMessage)
+        events?.off('afterMessage', onAfterMessage)
+      }
+      if (
+        messageStack.length !== 0 ||
+        topLevelMessageCount < block.transactions.length
+      ) {
+        spendTraceComplete = false
+      }
+      for (let transactionIndex = 0; transactionIndex < block.transactions.length; transactionIndex += 1) {
+        const tx = block.transactions[transactionIndex]
+        const txResult = result.results[transactionIndex]
+        if (tx === undefined || txResult === undefined) {
+          spendTraceComplete = false
+          continue
+        }
+        if (txResult.amountSpent > 0n) {
+          recordSpendActivity(
+            tx.getSenderAddress().toString(),
+            transactionIndex,
+            'transaction-fee',
+            txResult.amountSpent,
+          )
+        }
       }
       const outcomes = outcomesFromRunResult(block, result)
       const receiptRlpHexes = result.receipts.map((receipt, receiptIndex) => {
@@ -1686,6 +1818,8 @@ export class PersistentBlockProcessor {
       common: genesisSession.common,
       blocks: records.map(({ block }) => block),
       records,
+      spendActivityByAddress,
+      spendTraceComplete,
       report: {
         tip: { number: parent.header.number, hash: tipHash },
         genesisStateRoot: asBytesHex(genesisSession.genesisStateRoot),

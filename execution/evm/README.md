@@ -285,14 +285,18 @@ The module is deliberately conservative and honest about its limits:
   after-credit-before-spend to `revert-l2-credit`, after-spend to
   `freeze-bridge` (the whitepaper's defined invalid state), and re-inclusion to
   `no-op` or `credit-l2-once`.
-- `assessCreditSpend` returns `spent` only when the recipient tip balance is
-  below the credited amount, otherwise `unknown`; it never returns `unspent`.
+- Canonical replay traces top-level and nested native-value transfers, sender
+  fees, and selfdestructs. `assessCreditSpend` reports `outflow-observed`,
+  `no-outflow-observed`, or `unknown`; `classifyCanonicalDepositReorg` freezes
+  on observed or unknown outflow and allows re-derivation only after a complete
+  trace reports no post-credit outflow.
 
-What it does **not** do: it does not re-derive canonical L2 history to remove an
-unbacked credit, does not attribute arbitrary EVM spends to a specific credit,
-and does not make the bridge trustless or production-safe. The after-credit and
-after-spend cases accept an explicit `creditSpent` input and default to the
-conservative freeze. See `docs/DEPOSIT-REORG-ACCOUNTING-v0.1.md`.
+This is conservative address-level evidence, not source-specific attribution
+among fungible credits: spending from an address can freeze recovery even when
+pre-existing or later funds covered the outflow. Recovery still requires an
+operator invocation, and cross-process writer/recovery coordination is not
+implemented. This does not make the bridge trustless or production-safe. See
+`docs/DEPOSIT-REORG-ACCOUNTING-v0.1.md`.
 
 <a id="deposit-reorg-recovery"></a>
 
@@ -356,8 +360,8 @@ tip frozen and the candidate store available for retry. Recovery coordination
 is in-process and scoped to one processor instance; independent processes
 sharing a chain directory are not coordinated.
 
-**Still partial:** automatic attribution of an EVM spend to a specific credit,
-cross-process recovery coordination, and any network/L1 action. See
+**Still partial:** source-specific attribution among fungible credits,
+cross-process recovery coordination, and any network/L1 watcher action. See
 `docs/DEPOSIT-REORG-RECOVERY-v0.1.md`.
 
 ## Fixed execution assumptions

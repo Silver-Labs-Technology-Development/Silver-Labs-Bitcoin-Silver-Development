@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { createFeeMarket1559Tx } from '@ethereumjs/tx'
-import { Address, createAddressFromPrivateKey, hexToBytes } from '@ethereumjs/util'
+import { Address, bytesToHex, createAddressFromPrivateKey, hexToBytes } from '@ethereumjs/util'
 import {
   GENESIS_TIMESTAMP,
   PersistentBlockProcessor,
@@ -24,9 +24,11 @@ import { createEvmDepositOperation } from '../src/depositPrelude.js'
 import {
   assessCreditSpend,
   calculateDepositAccounting,
+  classifyCanonicalDepositReorg,
   classifyDepositReorg,
   collectCanonicalDepositCredits,
 } from '../src/depositReorgAccounting.js'
+import type { CanonicalReadView } from '../src/blockProcessor.js'
 import type { DepositCredit } from '../src/depositReorgAccounting.js'
 import type { BtcsL1DepositRecord } from '../src/btcsL1DepositStore.js'
 import type {
@@ -347,7 +349,10 @@ test('a reorganized-out deposit whose credit was spent freezes the bridge', asyn
 
     const view = await chain.createCanonicalReadView()
     const credits = collectCanonicalDepositCredits(view)
-    assert.equal(await assessCreditSpend(view, credits[0]!), 'spent')
+    const assessment = await assessCreditSpend(view, credits[0]!)
+    assert.equal(assessment.status, 'outflow-observed')
+    assert.equal(assessment.basis, 'canonical-execution-trace')
+    assert.equal(assessment.activity?.kind, 'native-value')
     assert.ok(
       (await view.getAccountBalance(recipient)) < BigInt(operation.amountWei),
     )
@@ -364,7 +369,7 @@ test('a reorganized-out deposit whose credit was spent freezes the bridge', asyn
   })
 })
 
-test('an untouched credited deposit is only unknown spend evidence', async () => {
+test('a complete trace with no post-credit outflow proves the credit was not spent', async () => {
   await withFixture(async ({ store, chain }) => {
     const record = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
     const operation = createEvmDepositOperation(record)
@@ -372,11 +377,257 @@ test('an untouched credited deposit is only unknown spend evidence', async () =>
 
     const view = await chain.createCanonicalReadView()
     const credits = collectCanonicalDepositCredits(view)
-    assert.equal(await assessCreditSpend(view, credits[0]!), 'unknown')
+    assert.deepEqual(await assessCreditSpend(view, credits[0]!), {
+      status: 'no-outflow-observed',
+      basis: 'canonical-execution-trace',
+    })
     assert.equal(
       await view.getAccountBalance(recipient),
       BigInt(operation.amountWei),
     )
+  })
+})
+
+test('transaction fees count as outflow even when the transaction transfers no value', async () => {
+  await withFixture(async ({ store, chain }) => {
+    const record = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
+    const operation = createEvmDepositOperation(record)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [operation])
+
+    const feeOnly = signedByRecipient({ nonce: 0n, to: otherAccount, value: 0n })
+    await chain.buildNextBlock([feeOnly], GENESIS_TIMESTAMP + 2n)
+
+    const view = await chain.createCanonicalReadView()
+    const credit = collectCanonicalDepositCredits(view)[0]!
+    const assessment = await assessCreditSpend(view, credit)
+    assert.equal(assessment.status, 'outflow-observed')
+    assert.equal(assessment.activity?.kind, 'transaction-fee')
+    assert.ok(BigInt(assessment.activity?.amountWei ?? '0') > 0n)
+  })
+})
+
+test('post-credit outflow is detected even when later funding keeps balance above the credit', async () => {
+  await withFixture(async ({ store, chain }) => {
+    const firstRecord = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
+    const firstOperation = createEvmDepositOperation(firstRecord)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [firstOperation])
+
+    const spend = signedByRecipient({ nonce: 0n, to: otherAccount, value: 1n })
+    await chain.buildNextBlock([spend], GENESIS_TIMESTAMP + 2n)
+
+    const laterRecord = makeRecord({
+      depositId: `${'d'.repeat(64)}:0`,
+      txid: 'd'.repeat(64),
+      recipientAddress: recipient.toString().toLowerCase(),
+      amountSats: (BigInt(amountSats) / 2n).toString(10),
+      blockHash: 'e'.repeat(64),
+      blockHeight: 201,
+      confirmations: 8,
+    })
+    const laterOperation = createEvmDepositOperation(laterRecord)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 3n, [laterOperation])
+
+    const view = await chain.createCanonicalReadView()
+    const credits = collectCanonicalDepositCredits(view)
+    assert.equal(credits.length, 2)
+    assert.ok((await view.getAccountBalance(recipient)) > BigInt(firstOperation.amountWei))
+
+    const firstAssessment = await assessCreditSpend(view, credits[0]!)
+    assert.equal(firstAssessment.status, 'outflow-observed')
+    assert.equal(firstAssessment.activity?.blockNumber, 2n)
+    assert.equal(firstAssessment.activity?.kind, 'native-value')
+
+    const laterAssessment = await assessCreditSpend(view, credits[1]!)
+    assert.deepEqual(laterAssessment, {
+      status: 'no-outflow-observed',
+      basis: 'canonical-execution-trace',
+    })
+
+    await invalidateBtcsL1DepositAfterConfirmedReorg(store, depositId, originalBlockHash)
+    const classification = await classifyCanonicalDepositReorg({
+      depositId,
+      view,
+      l1: store.get(depositId),
+      credit: credits[0],
+    })
+    assert.equal(classification.spendAssessment?.status, 'outflow-observed')
+    assert.equal(classification.plan.action, 'freeze-bridge')
+
+    const laterClassification = await classifyCanonicalDepositReorg({
+      depositId: credits[1]!.depositId,
+      view,
+      l1: undefined,
+      credit: credits[1],
+    })
+    assert.equal(laterClassification.spendAssessment?.status, 'no-outflow-observed')
+    assert.equal(laterClassification.plan.action, 'revert-l2-credit')
+  })
+})
+
+test('incomplete spend traces freeze an unbacked credit instead of assuming it was untouched', async () => {
+  const credit = creditForRecord(makeRecord())
+  const view = {
+    getSpendActivitySince: () => undefined,
+    spendTraceComplete: false,
+    async getAccountBalance() {
+      return BigInt(credit.amountWei)
+    },
+  } as unknown as CanonicalReadView
+
+  const classification = await classifyCanonicalDepositReorg({
+    depositId: credit.depositId,
+    view,
+    l1: undefined,
+    credit,
+  })
+  assert.equal(classification.spendAssessment?.status, 'unknown')
+  assert.equal(classification.plan.action, 'freeze-bridge')
+})
+
+test('canonical execution tracing observes a value transfer from a credited contract', async () => {
+  await withFixture(async ({ store, chain }) => {
+    const deployerRecord = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
+    const deployerOperation = createEvmDepositOperation(deployerRecord)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [deployerOperation])
+
+    const runtime = Uint8Array.from([
+      0x60, 0x00, // return data length
+      0x60, 0x00, // return data offset
+      0x60, 0x00, // input data length
+      0x60, 0x00, // input data offset
+      0x60, 0x01, // value
+      0x73, ...otherAccount.bytes, // recipient
+      0x61, 0xff, 0xff, // gas
+      0xf1, // CALL
+      0x50, // POP result
+      0x00, // STOP
+    ])
+    const initCode = Uint8Array.from([
+      0x60, runtime.length,
+      0x60, 0x0c,
+      0x60, 0x00,
+      0x39,
+      0x60, runtime.length,
+      0x60, 0x00,
+      0xf3,
+      ...runtime,
+    ])
+    const deploy = createFeeMarket1559Tx({
+      chainId: EVM_CHAIN_ID,
+      nonce: 0n,
+      gasLimit: 300_000n,
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFeePerGas: 1_000_000_000n,
+      value: 0n,
+      data: initCode,
+    }, { common: createHarnessCommon() }).sign(recipientKey)
+    const deploymentBlock = await chain.buildNextBlock([deploy], GENESIS_TIMESTAMP + 2n)
+    const contractAddressHex = deploymentBlock.summary.receipts[0]?.createdAddress
+    assert.ok(contractAddressHex)
+    const contractAddress = new Address(hexToBytes(contractAddressHex as `0x${string}`))
+
+    const contractRecord = makeRecord({
+      depositId: `${'f'.repeat(64)}:0`,
+      txid: 'f'.repeat(64),
+      recipientAddress: contractAddress.toString().toLowerCase(),
+      amountSats: '100',
+      blockHash: 'e'.repeat(64),
+      blockHeight: 202,
+      confirmations: 8,
+    })
+    const contractOperation = createEvmDepositOperation(contractRecord)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 3n, [contractOperation])
+
+    const invoke = createFeeMarket1559Tx({
+      chainId: EVM_CHAIN_ID,
+      nonce: 1n,
+      gasLimit: 150_000n,
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFeePerGas: 1_000_000_000n,
+      to: contractAddress,
+      value: 0n,
+    }, { common: createHarnessCommon() }).sign(recipientKey)
+    const invocationBlock = await chain.buildNextBlock([invoke], GENESIS_TIMESTAMP + 4n)
+    assert.equal(invocationBlock.summary.receipts[0]?.status, 1)
+
+    const view = await chain.createCanonicalReadView()
+    const contractCredit = collectCanonicalDepositCredits(view).find(
+      (credit) => credit.depositId === contractOperation.depositId,
+    )
+    assert.ok(contractCredit)
+    const assessment = await assessCreditSpend(view, contractCredit)
+    assert.equal(assessment.status, 'outflow-observed')
+    assert.equal(assessment.activity?.kind, 'native-value')
+    assert.equal(assessment.activity?.amountWei, '1')
+    assert.equal(assessment.activity?.transactionIndex, 0)
+    assert.equal(assessment.activity?.transactionHash, bytesToHex(invoke.hash()).toLowerCase())
+    assert.equal(assessment.activity?.blockNumber, 4n)
+  })
+})
+
+test('canonical execution tracing observes a credited contract selfdestruct', async () => {
+  await withFixture(async ({ store, chain }) => {
+    const deployerRecord = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
+    const deployerOperation = createEvmDepositOperation(deployerRecord)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [deployerOperation])
+
+    const runtime = Uint8Array.from([0x73, ...otherAccount.bytes, 0xff])
+    const initCode = Uint8Array.from([
+      0x60, runtime.length,
+      0x60, 0x0c,
+      0x60, 0x00,
+      0x39,
+      0x60, runtime.length,
+      0x60, 0x00,
+      0xf3,
+      ...runtime,
+    ])
+    const deploy = createFeeMarket1559Tx({
+      chainId: EVM_CHAIN_ID,
+      nonce: 0n,
+      gasLimit: 300_000n,
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFeePerGas: 1_000_000_000n,
+      value: 0n,
+      data: initCode,
+    }, { common: createHarnessCommon() }).sign(recipientKey)
+    const deploymentBlock = await chain.buildNextBlock([deploy], GENESIS_TIMESTAMP + 2n)
+    const contractAddressHex = deploymentBlock.summary.receipts[0]?.createdAddress
+    assert.ok(contractAddressHex)
+    const contractAddress = new Address(hexToBytes(contractAddressHex as `0x${string}`))
+
+    const contractRecord = makeRecord({
+      depositId: `${'8'.repeat(64)}:0`,
+      txid: '8'.repeat(64),
+      recipientAddress: contractAddress.toString().toLowerCase(),
+      amountSats: '100',
+      blockHash: '9'.repeat(64),
+      blockHeight: 203,
+      confirmations: 8,
+    })
+    const contractOperation = createEvmDepositOperation(contractRecord)
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 3n, [contractOperation])
+
+    const invoke = createFeeMarket1559Tx({
+      chainId: EVM_CHAIN_ID,
+      nonce: 1n,
+      gasLimit: 100_000n,
+      maxFeePerGas: 2_000_000_000n,
+      maxPriorityFeePerGas: 1_000_000_000n,
+      to: contractAddress,
+      value: 0n,
+    }, { common: createHarnessCommon() }).sign(recipientKey)
+    await chain.buildNextBlock([invoke], GENESIS_TIMESTAMP + 4n)
+
+    const view = await chain.createCanonicalReadView()
+    const credit = collectCanonicalDepositCredits(view).find(
+      (candidate) => candidate.depositId === contractOperation.depositId,
+    )
+    assert.ok(credit)
+    const assessment = await assessCreditSpend(view, credit)
+    assert.equal(assessment.status, 'outflow-observed')
+    assert.equal(assessment.activity?.kind, 'selfdestruct')
+    assert.equal(assessment.activity?.transactionIndex, 0)
   })
 })
 

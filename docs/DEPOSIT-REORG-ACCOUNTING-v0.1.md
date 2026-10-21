@@ -1,6 +1,6 @@
 # BTCS L2 — Deposit Reorg Accounting (v0.1)
 
-Status: **PROTOTYPE — accounting module IMPLEMENTED and tested; full recovery PARTIAL**.
+Status: **PROTOTYPE — accounting, canonical spend tracing, and conservative reorg classification IMPLEMENTED and tested; cross-process recovery coordination PARTIAL**.
 Task: `BTCS-L2-SECURITY-001` (see `docs/WORK-QUEUE.md`).
 Source: `execution/evm/src/depositReorgAccounting.ts`,
 tests: `execution/evm/tests/depositReorgAccounting.test.ts`.
@@ -21,13 +21,14 @@ In scope:
   canonical L2 deposit credits.
 - A deterministic remediation plan for each timing of an L1 reorg relative to
   verification, L2 credit, and L2 spend.
-- A sound, partial local signal for whether a credit has been spent.
+- A replay-derived signal for whether a credited address had native-value outflow
+  or paid transaction fees after the credit was applied.
 
 Out of scope (not implemented here, do not assume):
 
 - Actually re-deriving the canonical L2 history without the removed credit.
-- Attributing arbitrary EVM spends to a specific credit (needs transaction-level
-  tracing).
+- Proving that a fungible native-value outflow was funded by one particular
+  deposit credit rather than the recipient's pre-existing or later balance.
 - Withdrawals, escrow, forced inclusion, data availability, or any proof system.
 - A trustless L1 inclusion proof. Verification still uses a trusted local Core
   RPC (`src/btcsL1Deposit.ts`).
@@ -69,7 +70,14 @@ must halt new security-sensitive bridge progression until reconciled.
 
 ## 4. Required reorg cases (whitepaper §2.5, §25, §50)
 
-`classifyDepositReorg` maps each case to a plan:
+`classifyDepositReorg` maps each case to a plan when the caller already has a
+spend decision. `classifyCanonicalDepositReorg` derives that decision from a
+replay-verified view and applies the conservative policy automatically:
+
+- observed address outflow after the credit → treat as potentially spent and
+  freeze if L1 backing is gone;
+- complete trace with no later outflow → allow canonical re-derivation;
+- incomplete trace with no positive evidence → treat as unknown and freeze.
 
 | Case | L1 state | L2 credit | spent | timing | action |
 | --- | --- | --- | --- | --- | --- |
@@ -89,21 +97,36 @@ committed the now-unbacked credit. `freeze-bridge` maps to the whitepaper's
 commit time (`collectCommittedDepositIds` in `src/blockProcessor.ts`); the
 accounting layer re-detects it over a supplied credit set.
 
-## 5. Conservative spend evidence
+## 5. Replay-derived spend evidence
 
-`assessCreditSpend(view, credit)` returns `'spent'` **only** when the recipient
-balance at the canonical tip is strictly below the credited amount, which proves
-at least part of the credit left the account. It otherwise returns `'unknown'`
-and **never** `'unspent'`, because a sufficient fungible balance cannot prove the
-credit was not spent. Example: a recipient funded with exactly the credit
-returns `'unknown'`; after transferring half the credit, it returns `'spent'`.
+During canonical replay, the execution VM records native-value movements from
+top-level transactions and nested EVM calls, sender fee payments, and
+selfdestruct balance exits. Evidence is associated with the address and block
+where the activity occurred. `assessCreditSpend(view, credit)` considers
+activity at or after `creditedAtBlock`; later deposits do not erase earlier
+activity for an older credit.
 
-**Open decision.** The after-credit-before-spend vs after-spend distinction is
-genuinely a re-derivation problem, not a balance problem. This prototype accepts
-`creditSpent` as an explicit caller input and defaults to the conservative
-`freeze-bridge` whenever the credit is unbacked and cannot be proven unspent.
-Deciding when an unbacked-but-unprovable credit may be optimistically reverted
-requires the L2 re-derivation design and is **not** decided here.
+The result is one of:
+
+| Result | Meaning |
+| --- | --- |
+| `outflow-observed` | The credited address sent native value, paid a transaction fee, or selfdestructed after the credit. The recovery classifier treats it as potentially spent. |
+| `no-outflow-observed` | Every canonical transaction was traced, and no such activity followed the credit. The classifier may re-derive without the credit. |
+| `unknown` | The trace was incomplete and the balance floor did not establish outflow. The classifier freezes when backing is absent. |
+
+Address-level activity is intentionally conservative, not source-specific coin
+accounting. If an address had enough unrelated funds to cover an outflow, the
+credit may be incorrectly treated as potentially spent and recovery may freeze
+unnecessarily. This avoids removing backing after an ambiguous spend. Nested
+activity in a child frame that later rolls back can also produce a conservative
+false positive. A positive balance floor is never used to prove that an earlier
+credit was untouched.
+
+`classifyCanonicalDepositReorg` wires the assessment to the deterministic reorg
+plan. It treats `unknown` as potentially spent; only a complete trace with no
+post-credit outflow produces `revert-l2-credit`. Recovery itself still runs only
+when an operator invokes the recovery API; this module is not an always-on L1
+watcher.
 
 ## 6. What this proves / does not prove
 
@@ -113,20 +136,24 @@ Proves (by tests, no BTCS Core required):
   real canonical L2 credits from a `PersistentBlockProcessor` chain.
 - A credited deposit keeps the invariant; invalidating its L1 inclusion trips
   `unbacked-credit` and blocks progression.
-- A reorged-out, fully or partly spent credit is detectable (`spent`) and maps
-  to `freeze-bridge`.
+- Replay tracing detects direct EOA transfers, internal contract value transfers,
+  and sender fees even when later funding leaves the recipient balance above the
+  earlier credit amount.
+- A complete trace with no post-credit outflow maps to `revert-l2-credit`; a
+  positive or incomplete trace maps conservatively to `freeze-bridge`.
 
 Does **not** prove:
 
 - That L2 state can be re-derived to remove an unbacked credit.
-- That `spent` detection is complete (it is intentionally one-sided).
+- Source-specific attribution among fungible credits; the implemented policy is
+  address-level and can false-positive.
+- Coordination between independent OS processes sharing one chain directory.
 - Any production bridge, vault, withdrawal, forced-inclusion, or proof security.
 
 ## 7. Follow-up
 
 1. Implement canonical L2 re-derivation and wire `revert-l2-credit` to it.
-2. Implement transaction-trace spend attribution to replace the explicit
-   `creditSpent` input and the one-sided balance signal.
-3. Persist the bridge accounting state alongside the deposit store and gate block
-   production on `progressBlocked`.
+2. Coordinate recovery gates and canonical writes across independent OS processes.
+3. Persist bridge accounting state alongside the deposit store and gate block
+   production on `progressBlocked` when an always-on bridge coordinator exists.
 4. Add a multi-implementation convergence test (whitepaper §49 acceptance).
