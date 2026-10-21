@@ -15,6 +15,7 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 | BTCS-L2-SECURITY-004 | Atomically adopt re-derived canonical store | READY_FOR_REVIEW | execution/evm/src/blockProcessor.ts, execution/evm/src/depositReorgRecovery.ts, execution/evm/tests/depositReorgRecovery.test.ts, docs/DEPOSIT-REORG-RECOVERY-v0.1.md, execution/evm/README.md | `recoverDepositReorg` installs the verified candidate by copying immutable records, atomically committing `chain.json`, then clearing the gate; a failed pre-commit adoption leaves the old tip frozen and candidate retryable. Node v24.17.0: typecheck passes; full suite 222/222 |
 | BTCS-L2-SECURITY-005 | Canonical EVM spend evidence and conservative reorg classification | READY_FOR_REVIEW | execution/evm/src/blockProcessor.ts, execution/evm/src/depositReorgAccounting.ts, execution/evm/tests/depositReorgAccounting.test.ts, docs/DEPOSIT-REORG-ACCOUNTING-v0.1.md | Canonical replay traces direct and nested value transfers, sender fees, and selfdestructs; incomplete evidence freezes unbacked credits, while complete no-outflow evidence permits re-derivation. Node v24.17.0: typecheck passes; focused accounting tests 20/20; full EVM suite 227/227 |
 | BTCS-L2-SECURITY-006 | Coordinate chain writes and deposit recovery across processes | READY_FOR_REVIEW | execution/evm/src/chainDirectoryLock.ts, execution/evm/src/blockProcessor.ts, execution/evm/src/depositReorgRecovery.ts, execution/evm/tests/chainDirectoryLock.test.ts, execution/evm/tests/fixtures/chain-directory-writer.ts, execution/evm/README.md, docs/DEPOSIT-REORG-RECOVERY-v0.1.md | Initialization, canonical writes, read snapshots, checkpoint export, and the complete recovery freeze/rederive/adopt flow use a fail-closed OS file lock and refresh `chain.json`. Two fresh processes serialize genesis and concurrent appends; a stale long-lived processor refreshes, stale/malformed lock tests preserve metadata. Node v24.17.0 typecheck passes; full EVM suite 229/229 |
+| BTCS-L2-L1-001 | Reproducible real regtest settlement-anchor publication | READY_FOR_REVIEW | execution/evm/package.json, execution/evm/scripts/regtest-anchor-e2e.ts, execution/evm/README.md, docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md | Node v24.17.0 npm run e2e:anchor PASS: signed transaction with exactly one expected anchor was mempool-accepted, confirmed at block 305, independently matched the 2-block batch commitment, and the confirmed publication record survived store reopen. Batch body was not published. |
 
 ## Acceptance criteria
 
@@ -29,6 +30,16 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 - `npm run typecheck` and `npm test` pass.
 - On Node v24.17.0, the live regtest E2E passes from the existing dedicated chain at height 101; the recorded deposit has two confirmations and the settlement replay matches the independently derived state root and recipient balance.
 - Reorg-after-spend is conservatively detected and freezes the bridge; source-specific attribution among fungible credits and automatic reorg watching remain unresolved.
+
+### BTCS-L2-L1-001
+
+- `npm run e2e:anchor` invokes the local `tsx` script and never starts or stops Core.
+- Preflight requires readable cookie, reachable Core, `chain=regtest`, and the configured wallet.
+- The runner independently verifies the batch before signing and broadcasting one transaction containing exactly one expected anchor script.
+- It verifies the active-chain inclusion through trusted Core RPC and confirms the durable publication state survives store reopen.
+- Documentation describes configuration, persistent wallet/data/store effects, safe shutdown, and that the L1 transaction publishes only the batch commitment (not the batch data).
+- A live regtest result is saved with transaction, block, and commitment identifiers; destructive reorg mode remains separate and opt-in.
+- Node v24.17.0 npm run e2e:anchor passes against a dedicated regtest; the confirmed publication record survives store reopen.
 
 ### BTCS-L2-SECURITY-001
 

@@ -185,6 +185,40 @@ automatic mining, withdrawals or production balance semantics, remote RPC, any
 L1 publication, settlement, or finality, or any production sequencer, rollup,
 proof system, or BTCS settlement client.
 
+<a id="regtest-anchor-publication-e2e"></a>
+
+## Regtest settlement-anchor publication E2E (`e2e:anchor`)
+
+`npm run e2e:anchor` runs the existing `scripts/regtest-anchor-e2e.ts`
+through the locally installed `tsx`. It independently verifies an L2 batch,
+constructs and signs a BTCS transaction with one OP_RETURN batch commitment,
+broadcasts it to a dedicated regtest node, mines the inclusion block, verifies
+the anchor through trusted Core RPC, and checks that the confirmed publication
+record survives store reopen. The script does not start or stop Core.
+
+Defaults are port `29443`, wallet `btcs-l2-anchor-regtest`, data directory
+`~/.local/share/btcs-l2-regtest-core`, and publication store
+`~/.local/share/btcs-l2-regtest-publications`. Override them with
+`BTCS_L2_REGTEST_PORT`, `BTCS_L2_REGTEST_WALLET`,
+`BTCS_L2_REGTEST_DATADIR`, and `BTCS_L2_PUBLICATION_STORE_DIR`.
+The data directory and daemon must already exist; Core must report
+`chain=regtest`, and the configured wallet must be loaded and funded enough to
+pay a regtest fee. The script uses the data directory's
+`regtest/.cookie` for authenticated loopback RPC.
+
+The ordinary command mines one block and persists wallet/data and publication
+state. It writes no repository files. Stop only the daemon you started by using
+the same `bitcoinsilver-cli`, data directory, and RPC port with `stop`.
+
+The anchor transaction publishes the 39-byte batch commitment only. It does not
+publish the batch body, so this E2E does not prove data availability or permit
+reconstruction from BTCS data. `BTCS_L2_REGTEST_REORG_TEST=1` enables a separate
+destructive `invalidateblock` scenario and is restricted in the script to its
+dedicated port, data directory, wallet, and publication store; do not set it for
+the ordinary publication run.
+
+Recorded live run: [regtest anchor publication results](../../docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md).
+
 <a id="regtest-deposit-settlement-e2e"></a>
 
 ## Regtest deposit-to-settlement E2E (`e2e:deposit`)
