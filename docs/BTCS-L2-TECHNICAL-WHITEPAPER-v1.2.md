@@ -9,9 +9,23 @@
 **Status:** Evolving technical specification / prototype engineering record\
 **Primary objective:** Extend Bitcoin Silver with a programmable, EVM-compatible Layer 2 while preserving BTCS as the monetary, store-of-value, gas, and settlement base.
 
-## Current Engineering Snapshot — 2026-10-11 (v1.2)
+## Current Engineering Snapshot — 2026-10-21 (v1.2 update)
 
-**Position:** local EVM execution, persistence/replay/checkpoints, settlement batches, local RPC and the development sequencer have substantial automated test coverage. Deposit-verification/store logic and state-root-committed deposit operations are tested locally. A read-only OpenCode audit recorded branch `experimental/deposit-prelude-v1`, HEAD `1ffcdb6`, and confirmed the expected BTCS Core CLI exists, but the dedicated RPC endpoint at `127.0.0.1:29445` is not responding. The regtest E2E script exists but is not exposed as an npm script, is not documented in the EVM README, has not been shown passing, and has no test/CI coverage because it requires external Core. Node `v24.17.0` is already installed at `~/.nvm/versions/node/v24.17.0/bin/node`, while `/usr/bin/node` defaults to `v18.19.1`. **Stage 4 integration is still unproven; the complete rollup is not production-ready.**
+Historical audit notes later in §2.6 describe the repository as it stood on
+2026-10-11; this snapshot supersedes their current-status and next-task
+statements.
+
+**Position:** the local execution, persistence/replay/checkpoint, settlement,
+deposit-recovery, and local cross-process locking prototypes are implemented.
+Under Node `v24.17.0`, `npm run typecheck` passes and the full EVM suite passes
+229/229. A real BTCS Core regtest run confirmed a 0.1 BTC L1 deposit, verified
+and persisted the deposit record, committed the matching L2 credit, and
+independently replayed a v2 settlement batch with matching state root and
+recipient balance. The run used trusted local Core RPC and did not publish a
+settlement anchor or simulate an L1 reorganization. Local chain-directory
+coordination is implemented for cooperating processes on one local filesystem;
+the spend evidence remains conservative address-level evidence. **This is a
+verified prototype, not a production rollup or trustless bridge.**
 
 | Workstream | Current status | Evidence and boundary |
 | :--- | :--- | :--- |
@@ -21,55 +35,38 @@
 | Local RPC and development sequencer | **Prototype implemented and tested** | Loopback-only read RPC and explicit development transaction production are covered. Pending transactions are in memory and are lost on process restart. |
 | Client integration demo (`BTCS-L2-CLIENT-002`) | **READY_FOR_REVIEW** | The demo test and batch-verifier integration test pass in the reported suite. The work queue requires human review before marking the task complete. |
 | BTCS L1 anchor publication | **Components tested; real E2E not yet established** | Anchor payload/script, trusted-Core-RPC confirmation checks, and publication-state transitions are tested. Unit tests do not establish a live/regtest publication workflow. |
-| BTCS L1 deposits and L2 credit | **Deposit-prelude prototype implemented; regtest E2E pending** | The active branch contains a deposit intent/recipient decoder, trusted Core RPC verification, durable deposit records, reorg invalidation/re-observation logic, and state-root-committed deposit credit. The test script has been inspected; the configured regtest node still needs a read-only preflight before execution. |
-| Reorg after credited funds have been spent | **Known critical gap** | Deposit inclusion can be invalidated and re-observed at the record layer, but recovery/accounting when the corresponding L2 credit has already been spent is explicitly not implemented. |
+| BTCS L1 deposits and L2 credit | **Deposit-prelude prototype implemented; real regtest E2E PASS** | A 0.1 BTC deposit was verified through trusted local Core RPC, stored durably, credited into the L2 state root, and included in an independently replayed v2 settlement batch. See `docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`. |
+| Deposit reorganization and recovery | **Fail-closed prototype implemented; source attribution remains partial** | Canonical EVM replay tracks native value outflow, fees, and selfdestructs; local recovery freezes, re-derives, and adopts under a cross-process directory lock. Address-level evidence can false-positive among fungible credits; automatic L1 watching and multi-host coordination are not implemented. |
 | Production rollup security | **Not delivered** | Trust-minimized custody, withdrawals, forced inclusion, complete data availability and clean-node reconstruction from BTCS data, fraud/validity proof enforcement, and production reorg/accounting guarantees remain open. |
 
-### Latest observed test evidence
+### Latest verified evidence
 
-The user ran these commands in `execution/evm`:
+In `execution/evm`, Node `v24.17.0` passes `npm run typecheck` and the full
+EVM suite passes **229/229**. The real deposit-to-settlement E2E also passes.
+Its full result, identifiers, and limits are recorded in
+`docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`.
 
-```text
-node --version: v18.19.1
-npm run typecheck: passed
-npm test: 178 passed, 0 failed, 0 skipped
-```
+### Deposit E2E configuration and observed effects
 
-The 178-test suite includes client-demo integration and batch verification tests, deposit parsing/verification/store/workflow tests, deposit-prelude state-root/replay tests, settlement v2 deposit-operation tests, RPC tests, checkpoint/replay tests, and development-sequencer tests. This is local prototype evidence only. The repository's documented runtime pin is Node `>=24.17.0 <25`; therefore the successful Node 18 run is useful but **does not satisfy the pinned-runtime acceptance check**. Re-run typecheck, the full suite, and the standalone demo under the pinned Node 24 runtime before declaring the client-demo task complete.
+`npm run e2e:deposit` uses the defaults and overrides documented in
+`execution/evm/README.md`. It requires an already running dedicated Core
+regtest daemon and does not start or stop Core itself. BTCS Core's coinbase
+maturity is 200 blocks, so the runner mines 201 funding blocks before creating,
+signing, and broadcasting one 0.1 BTC test deposit, then mines two confirmation
+blocks. The wallet, cookie, and mined regtest chain persist; temporary L2
+scratch data is removed. The successful run started from height 101, included
+the deposit at height 303, and stopped only the dedicated test daemon afterward.
 
-The terminal's last Git status check showed branch `experimental/deposit-prelude-v1` and no modified/untracked paths (`## experimental/deposit-prelude-v1`). No commit or push was performed as part of this checkpoint.
-
-### Deposit E2E harness defaults observed in source
-
-`execution/evm/scripts/regtest-deposit-settlement-e2e.ts` currently defines these defaults:
-
-- CLI: `~/Silver-Labs/btcs-core/build-noipc/bin/bitcoinsilver-cli` (overridable with `BTCS_CORE_CLI`);
-- dedicated regtest data directory: `~/.local/share/btcs-l2-deposit-regtest-20261011` (overridable with `BTCS_L1_REGTEST_DATADIR`);
-- RPC port: `29445` (overridable with `BTCS_L1_RPC_PORT`);
-- cookie path: `<datadir>/regtest/.cookie` (overridable with `BTCS_L1_RPC_COOKIE_PATH`);
-- test wallet name: `btcs-l2-deposit-e2e`;
-- required confirmations: `2`;
-- test deposit amount: `0.1 BTC` on **regtest only**;
-- fixed test recipient: `0x1111111111111111111111111111111111111111`.
-
-These are source defaults, not proof that the node is running or that the test has passed. The script has now been inspected. The expected CLI path exists and is executable, as confirmed by the terminal check; that alone does not establish an RPC server is running at the expected data directory and port.
-
-**Observed lifecycle and side effects from the script:**
-
-- The script does **not** launch or stop `bitcoinsilverd`; Core must already be running with the dedicated regtest data directory, port, and cookie expected by the script.
-- It first checks that `getblockchaininfo` reports `chain=regtest`.
-- It loads the named test wallet or creates it if it is absent.
-- It mines **101 blocks** to make local regtest funds spendable, constructs/signs/broadcasts a 0.1 BTC test deposit transaction with the `BTCSL2D` intent payload, and mines two more blocks to obtain the required confirmations.
-- It creates a temporary L2 scratch directory under the operating system's temp directory and removes that scratch directory in a `finally` block. It does not delete the BTCS Core data directory and does not call Core shutdown.
-- `package.json` currently has no dedicated npm script for this E2E. Once the pinned runtime and node preflight pass, it can be invoked directly through the already-installed local `tsx` executable, avoiding an implicit package download.
-
-The script has **not** yet been run against Core. Do not point it at a normal BTCS data directory, another project's shared regtest, or a wallet containing anything valuable. Use only `~/.local/share/btcs-l2-deposit-regtest-20261011` and port `29445`; the next step is a read-only `getblockchaininfo` preflight against that exact pair.
+The test establishes the local deposit → trusted-Core-RPC verification →
+durable record → state-root-committed L2 credit → independently replayed
+settlement path. It does not establish an L1 anchor publication workflow,
+trustless inclusion, an L1 reorg test, production escrow, or withdrawals.
 
 ### What the deposit prototype does — and does not mean
 
 The current model uses a BTCS transaction containing a `BTCSL2D` OP_RETURN intent that identifies the EVM recipient, alongside a payment to the configured deposit destination. A configured BTCS Core RPC is trusted to report transaction and active-chain details. After the required confirmations, a durable deposit record can be converted into a canonical L2 deposit operation; the operation is committed into L2 block state and protected against duplicate credit in the prototype.
 
-This is **not a trustless bridge**. The current implementation does not itself provide a BTCS SPV/light-client proof, an enforceable production vault, a withdrawal/exit protocol, or safe resolution of a reorg after the L2 credit has been spent. The fixed test recipient and regtest amount are fixtures, not production defaults to expose to users.
+This is **not a trustless bridge**. The current implementation does not itself provide a BTCS SPV/light-client proof, an enforceable production vault, or a withdrawal/exit protocol. It detects address-level outflows conservatively and freezes on a potentially spent invalidated credit; source-specific attribution and automatic reorg watching remain incomplete. The fixed test recipient and regtest amount are fixtures, not production defaults to expose to users.
 
 ### Current stage map
 
@@ -77,22 +74,29 @@ This is **not a trustless bridge**. The current implementation does not itself p
 | :--- | :--- | :--- |
 | **1 — EVM execution** | Local prototype broadly tested; pinned-runtime acceptance still outstanding | Run typecheck, full suite, client demo and verifier under Node `24.17.0`; later differential testing and production-engine decision. |
 | **2 — Storage, replay and recovery** | Persistence, canonical replay, checkpoint continuation tested | Define trusted bootstrap from L1-published data; broaden crash/corruption/reorg recovery. |
-| **3 — Settlement envelopes and batches** | Local validation and independent replay tested | Confirm integrated deposit operation through regtest settlement; maintain adversarial coverage. |
-| **4 — BTCS L1 settlement and deposits** | Components and an E2E script exist, but end-to-end result is not demonstrated; no npm command/README procedure, and Core RPC was unreachable at last check | First make the runner reproducible and fail-fast before side effects; review its preconditions and documentation; then, as a separate approved execution step, run it against an isolated regtest and record evidence. |
-| **5 — Rollup security** | Research/prototype gaps remain | Resolve reorg-after-spend accounting; design enforceable withdrawals, forced inclusion, data availability, and challenge/proof enforcement. |
+| **3 — Settlement envelopes and batches** | Local validation and independent replay tested; deposit settlement passed on regtest | Maintain adversarial coverage; connect publication to L1 and reconstruct published batch data. |
+| **4 — BTCS L1 settlement and deposits** | Deposit-to-settlement E2E PASS; anchor publication and always-on watching remain incomplete | Add transaction discovery, confirmation/reorg monitoring, reproducible anchor publication, and complete batch-data availability. |
+| **5 — Rollup security** | Local recovery is fail-closed; production security mechanisms remain unimplemented | Specify and prototype data availability, forced inclusion, disputes/proofs, withdrawals, and enforceable bridge custody/accounting. |
 | **6 — Production readiness** | Not reached | Independent security review, adversarial testnet, operational recovery drills, monitoring and governance. |
 
 ### Engineering priority — next work, in bounded tasks
 
-**Next task: `BTCS-L2-STAGE4-001` — Make the deposit E2E reproducible and fail-fast.** This is a repository/code-and-documentation task only. Add an explicit `e2e:deposit` npm script, add preflight checks for the configured CLI, daemon/RPC reachability, `chain=regtest`, and readable RPC cookie before any mining or transaction creation, and document prerequisites/commands/side effects in `execution/evm/README.md`. Update `docs/WORK-QUEUE.md` with the task and acceptance checks. Do not start/stop Core, mine, broadcast, delete or reset any data directory, or commit/push as part of this bounded task. Keep the E2E invocation's existing environment-variable overrides and ensure failures explain what must be corrected.
+**Completed prototype gates:** the client demo, SECURITY-001 through SECURITY-006,
+and the real deposit-to-settlement E2E are saved as `READY_FOR_REVIEW` items in
+`docs/WORK-QUEUE.md`; none is marked `COMPLETE` pending human review.
 
-**Next execution task, only after code review/approval: `BTCS-L2-STAGE4-002` — Run the isolated regtest E2E and preserve PASS evidence.** Before starting anything, verify the exact `bitcoinsilverd` flags via its help output, choose a dedicated datadir whose prior contents are not ambiguous (prefer a new isolated path over reusing an uninspected existing directory), start only that regtest daemon, confirm `getblockchaininfo` reports `chain=regtest`, run `npm run e2e:deposit` under Node `24.17.0`, capture the JSON result and Core height changes, and stop only the node started for this task. The E2E is expected to mine 101 plus two blocks and broadcast a 0.1 BTC **regtest-only** transaction. Do not run it against a normal BTCS data directory or a shared/valuable wallet.
+**Next bounded integration target:** create and implement an L1 deposit watcher
+that discovers configured deposit transactions, tracks confirmations, and
+surfaces confirmed reorgs to the existing fail-closed recovery workflow. Then
+connect the settlement-anchor transaction lifecycle and define/reconstruct the
+batch data required for availability. Keep trusted-Core-RPC, local-filesystem,
+and prototype security boundaries explicit.
 
-**Parallel acceptance item:** Node `24.17.0` is already installed at `~/.nvm/versions/node/v24.17.0/bin/node`. Prefix commands with `export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"` and run `npm run typecheck`, `npm test`, `npm run demo:client`, and `npm run verify:batch:execution` for the client-demo acceptance review. Keep `BTCS-L2-CLIENT-002` at `READY_FOR_REVIEW` until a human reviews the deliverable; do not silently mark it complete.
-
-**Following security task:** `BTCS-L2-SECURITY-001` — specify and test accounting when an L1 deposit is reorganized out after its L2 credit has been spent. Include reorg-before-credit, after-credit-before-spend, after-spend, re-inclusion, duplicate deposit and over-credit cases. This is a protocol safety blocker, not a cosmetic cleanup.
-
-Only after these gates should the project broaden toward clean-node reconstruction from BTCS-published data, enforceable withdrawals, forced inclusion, and proof/dispute enforcement.
+**Later gates:** proof/dispute enforcement, forced inclusion, withdrawals, and
+trust-minimized custody require separate protocol designs and adversarial
+validation. Production readiness also requires independent audit, adversarial
+testnet evidence, and operational recovery drills; this repository cannot
+substitute for those external reviews.
 ---
 
 # 1. Abstract

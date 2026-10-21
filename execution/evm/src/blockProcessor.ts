@@ -26,6 +26,10 @@ import type { RunBlockResult, RunTxResult } from '@ethereumjs/vm'
 import { createStateCheckpoint, openDurableStateManager } from './stateCheckpoint.js'
 import type { StateCheckpointManifest } from './stateCheckpoint.js'
 import {
+  DEFAULT_CHAIN_DIRECTORY_LOCK_TIMEOUT_MS,
+  withChainDirectoryLock,
+} from './chainDirectoryLock.js'
+import {
   EVM_CHAIN_ID,
   EVM_HARDFORK,
   GENESIS_BALANCE,
@@ -129,6 +133,8 @@ export type PersistentBlockProcessorOptions = Readonly<{
   beforeTipCommit?: () => void | Promise<void>
   /** Test-only persistence failpoint. Production callers should leave this unset. */
   persistenceTestHook?: (stage: PersistenceStage) => void | Promise<void>
+  /** Maximum wait for another process using the same chain directory. */
+  chainDirectoryLockTimeoutMs?: number
 }>
 
 export type PersistenceStage =
@@ -1115,6 +1121,7 @@ export class PersistentBlockProcessor {
   private readonly blocksDirectory: string
   private readonly beforeTipCommit?: () => void | Promise<void>
   private readonly persistenceTestHook?: (stage: PersistenceStage) => void | Promise<void>
+  private readonly chainDirectoryLockTimeoutMs: number
   private tipValue: ChainTip
   private genesisHashValue: string
   private operationTail: Promise<void> = Promise.resolve()
@@ -1129,6 +1136,8 @@ export class PersistentBlockProcessor {
     this.blocksDirectory = blocksDirectory
     this.beforeTipCommit = options.beforeTipCommit
     this.persistenceTestHook = options.persistenceTestHook
+    this.chainDirectoryLockTimeoutMs =
+      options.chainDirectoryLockTimeoutMs ?? DEFAULT_CHAIN_DIRECTORY_LOCK_TIMEOUT_MS
     this.tipValue = {
       number: BigInt(metadata.canonicalHeight),
       hash: metadata.canonicalTipHash,
@@ -1143,48 +1152,50 @@ export class PersistentBlockProcessor {
     const absoluteDirectory = resolve(directory)
     const blocksDirectory = resolve(absoluteDirectory, 'blocks')
     await mkdir(blocksDirectory, { recursive: true })
-    const metadataPath = resolve(absoluteDirectory, 'chain.json')
-    let metadataExists = true
-    let metadata: ChainMetadata | undefined
-    try {
-      const bytes = await readBoundedFile(metadataPath, MAX_CHAIN_METADATA_BYTES)
-      metadata = verifyMetadata(JSON.parse(new TextDecoder().decode(bytes)) as unknown)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        metadataExists = false
-      } else {
-        throw new ProtocolError(`cannot open chain metadata: ${messageOf(error)}`)
+    return withChainDirectoryLock(absoluteDirectory, async () => {
+      const metadataPath = resolve(absoluteDirectory, 'chain.json')
+      let metadataExists = true
+      let metadata: ChainMetadata | undefined
+      try {
+        const bytes = await readBoundedFile(metadataPath, MAX_CHAIN_METADATA_BYTES)
+        metadata = verifyMetadata(JSON.parse(new TextDecoder().decode(bytes)) as unknown)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          metadataExists = false
+        } else {
+          throw new ProtocolError(`cannot open chain metadata: ${messageOf(error)}`)
+        }
       }
-    }
 
-    if (!metadataExists) {
-      const genesis = await createGenesisRecord()
-      const genesisHash = asBytesHex(genesis.block.hash())
-      await validateGenesisOnlyStoreBeforeMetadataRecovery(
+      if (!metadataExists) {
+        const genesis = await createGenesisRecord()
+        const genesisHash = asBytesHex(genesis.block.hash())
+        await validateGenesisOnlyStoreBeforeMetadataRecovery(
+          blocksDirectory,
+          genesisHash,
+          genesis.record,
+        )
+        const expectedRecordPath = blockRecordPath(blocksDirectory, genesisHash)
+        await persistContentAddressedRecord(
+          expectedRecordPath,
+          genesis.record,
+          options.persistenceTestHook,
+        )
+        const initialTip = { number: 0n, hash: genesisHash }
+        metadata = newMetadata(genesisHash, initialTip)
+        await atomicWrite(metadataPath, encodeJson(metadata), 'tip', options.persistenceTestHook)
+      }
+      if (metadata === undefined) throw new ProtocolError('chain metadata could not be initialized')
+
+      const processor = new PersistentBlockProcessor(
+        absoluteDirectory,
         blocksDirectory,
-        genesisHash,
-        genesis.record,
+        metadata,
+        options,
       )
-      const expectedRecordPath = blockRecordPath(blocksDirectory, genesisHash)
-      await persistContentAddressedRecord(
-        expectedRecordPath,
-        genesis.record,
-        options.persistenceTestHook,
-      )
-      const initialTip = { number: 0n, hash: genesisHash }
-      metadata = newMetadata(genesisHash, initialTip)
-      await atomicWrite(metadataPath, encodeJson(metadata), 'tip', options.persistenceTestHook)
-    }
-    if (metadata === undefined) throw new ProtocolError('chain metadata could not be initialized')
-
-    const processor = new PersistentBlockProcessor(
-      absoluteDirectory,
-      blocksDirectory,
-      metadata,
-      options,
-    )
-    await processor.replay()
-    return processor
+      await processor.replayCanonical()
+      return processor
+    }, options.chainDirectoryLockTimeoutMs)
   }
 
   get tip(): ChainTip {
@@ -1205,18 +1216,51 @@ export class PersistentBlockProcessor {
     }
   }
 
+  /** Run a store operation under the OS lock and refresh the canonical tip. */
+  private async withStoreLock<T>(operation: () => Promise<T>): Promise<T> {
+    return withChainDirectoryLock(this.directory, async () => {
+      await this.refreshCanonicalTip()
+      return operation()
+    }, this.chainDirectoryLockTimeoutMs)
+  }
+
+  private async refreshCanonicalTip(): Promise<void> {
+    let metadata: ChainMetadata
+    try {
+      const bytes = await readBoundedFile(
+        resolve(this.directory, 'chain.json'),
+        MAX_CHAIN_METADATA_BYTES,
+      )
+      metadata = verifyMetadata(JSON.parse(new TextDecoder().decode(bytes)) as unknown)
+    } catch (error) {
+      throw new ProtocolError(`cannot refresh canonical chain metadata: ${messageOf(error)}`)
+    }
+    if (metadata.genesisHash !== this.genesisHashValue) {
+      throw new ProtocolError('canonical metadata genesis differs from the opened processor')
+    }
+    this.tipValue = {
+      number: BigInt(metadata.canonicalHeight),
+      hash: metadata.canonicalTipHash,
+    }
+  }
+
   /**
-   * Run recovery while holding the same exclusive queue as canonical block
-   * extensions. The view is captured only after earlier extensions complete.
-   * The callback must not extend this processor; recovery writes the gate before
-   * it releases the queue so later extensions observe the freeze.
+   * Hold the in-process queue and OS directory lock through recovery adoption.
+   * The callback receives the fresh canonical view and an adoption operation
+   * that does not reacquire the already-held locks.
    */
   async withDepositRecoveryLock<T>(
-    operation: (canonicalView: CanonicalReadView) => Promise<T>,
+    operation: (
+      canonicalView: CanonicalReadView,
+      adoptReDerivedStore: (directory: string) => Promise<ChainTip>,
+    ) => Promise<T>,
   ): Promise<T> {
-    return this.withExclusiveOperation(async () =>
-      operation(await this.createCanonicalReadView()),
-    )
+    return this.withExclusiveOperation(() => this.withStoreLock(async () =>
+      operation(
+        await this.createCanonicalReadViewUnlocked(),
+        (directory) => this.adoptReDerivedStoreUnlocked(directory),
+      ),
+    ))
   }
 
   /**
@@ -1225,54 +1269,58 @@ export class PersistentBlockProcessor {
    * update is the commit point. The recovery gate is removed only after commit.
    */
   async adoptReDerivedStore(reDerivedDirectory: string): Promise<ChainTip> {
-    return this.withExclusiveOperation(async () => {
-      const gate = await readDepositRecoveryGate(this.directory)
-      if (gate === undefined) {
-        throw new ProtocolError('cannot adopt a re-derived store without a frozen recovery gate')
-      }
+    return this.withExclusiveOperation(() => this.withStoreLock(
+      () => this.adoptReDerivedStoreUnlocked(reDerivedDirectory),
+    ))
+  }
 
-      const sourceDirectory = resolve(reDerivedDirectory)
-      if (sourceDirectory === this.directory) {
-        throw new ProtocolError('re-derived store must be separate from the canonical store')
-      }
-      await assertDepositRecoveryOpen(sourceDirectory)
+  private async adoptReDerivedStoreUnlocked(reDerivedDirectory: string): Promise<ChainTip> {
+    const gate = await readDepositRecoveryGate(this.directory)
+    if (gate === undefined) {
+      throw new ProtocolError('cannot adopt a re-derived store without a frozen recovery gate')
+    }
 
-      // Opening replays and validates the complete candidate before it can be
-      // installed. The source records remain content-addressed and immutable.
-      const candidate = await PersistentBlockProcessor.open(sourceDirectory)
-      if (candidate.genesisHashValue !== this.genesisHashValue) {
-        throw new ProtocolError('re-derived store genesis does not match the canonical store')
-      }
-      const records = await candidate.loadCanonicalRecords()
-      for (const { record } of records) {
-        await persistContentAddressedRecord(
-          blockRecordPath(this.blocksDirectory, record.blockHash),
-          record,
-          this.persistenceTestHook,
-        )
-      }
+    const sourceDirectory = resolve(reDerivedDirectory)
+    if (sourceDirectory === this.directory) {
+      throw new ProtocolError('re-derived store must be separate from the canonical store')
+    }
+    await assertDepositRecoveryOpen(sourceDirectory)
 
-      const adoptedTip = { ...candidate.tipValue }
-      const metadata = newMetadata(candidate.genesisHashValue, adoptedTip)
-      try {
-        await atomicWrite(
-          resolve(this.directory, 'chain.json'),
-          encodeJson(metadata),
-          'tip',
-          this.persistenceTestHook,
-        )
-      } catch (error) {
-        // The atomic rename may have committed even if a later durability hook
-        // failed. Reconcile memory with whichever metadata is now on disk.
-        await this.reconcileTipAfterFailedWrite(adoptedTip)
-        throw error
-      }
+    // Opening replays and validates the complete candidate before it can be
+    // installed. The source records remain content-addressed and immutable.
+    const candidate = await PersistentBlockProcessor.open(sourceDirectory)
+    if (candidate.genesisHashValue !== this.genesisHashValue) {
+      throw new ProtocolError('re-derived store genesis does not match the canonical store')
+    }
+    const records = await candidate.loadCanonicalRecords()
+    for (const { record } of records) {
+      await persistContentAddressedRecord(
+        blockRecordPath(this.blocksDirectory, record.blockHash),
+        record,
+        this.persistenceTestHook,
+      )
+    }
 
-      this.genesisHashValue = candidate.genesisHashValue
-      this.tipValue = adoptedTip
-      await clearDepositRecoveryGate(this.directory)
-      return { ...adoptedTip }
-    })
+    const adoptedTip = { ...candidate.tipValue }
+    const metadata = newMetadata(candidate.genesisHashValue, adoptedTip)
+    try {
+      await atomicWrite(
+        resolve(this.directory, 'chain.json'),
+        encodeJson(metadata),
+        'tip',
+        this.persistenceTestHook,
+      )
+    } catch (error) {
+      // The atomic rename may have committed even if a later durability hook
+      // failed. Reconcile memory with whichever metadata is now on disk.
+      await this.reconcileTipAfterFailedWrite(adoptedTip)
+      throw error
+    }
+
+    this.genesisHashValue = candidate.genesisHashValue
+    this.tipValue = adoptedTip
+    await clearDepositRecoveryGate(this.directory)
+    return { ...adoptedTip }
   }
 
   async buildNextBlock(
@@ -1284,7 +1332,7 @@ export class PersistentBlockProcessor {
     const canonicalDepositOperations = [
       ...normalizeEvmDepositOperations(depositOperations),
     ]
-    return this.withExclusiveOperation(async () => {
+    return this.withExclusiveOperation(() => this.withStoreLock(async () => {
       await assertDepositRecoveryOpen(this.directory)
       const session = await this.replayCanonical()
       const parent = session.blocks.at(-1)
@@ -1336,7 +1384,7 @@ export class PersistentBlockProcessor {
         if (error instanceof ProtocolError) throw error
         throw new ProtocolError(`block construction failed: ${messageOf(error)}`)
       }
-    })
+    }))
   }
 
   /**
@@ -1351,21 +1399,28 @@ export class PersistentBlockProcessor {
     blockRlp: Uint8Array,
     depositOperations: readonly EvmDepositOperation[] = [],
   ): Promise<ProcessedBlock> {
-    return this.withExclusiveOperation(async () => {
+    return this.withExclusiveOperation(() => this.withStoreLock(async () => {
       await assertDepositRecoveryOpen(this.directory)
       return this.appendBlockUnlocked(
         new Uint8Array(blockRlp),
         depositOperations,
       )
-    })
+    }))
   }
 
   async replay(): Promise<ReplayReport> {
-    const session = await this.replayCanonical()
-    return session.report
+    return this.withExclusiveOperation(() => this.withStoreLock(async () =>
+      (await this.replayCanonical()).report,
+    ))
   }
 
   async createCanonicalReadView(): Promise<CanonicalReadView> {
+    return this.withExclusiveOperation(() => this.withStoreLock(
+      () => this.createCanonicalReadViewUnlocked(),
+    ))
+  }
+
+  private async createCanonicalReadViewUnlocked(): Promise<CanonicalReadView> {
     return new CanonicalReadView(await this.replayCanonical())
   }
 
@@ -1375,7 +1430,7 @@ export class PersistentBlockProcessor {
    * change while replay and checkpoint publication are in progress.
    */
   async exportStateCheckpoint(checkpointDirectory: string): Promise<StateCheckpointManifest> {
-    return this.withExclusiveOperation(async () => {
+    return this.withExclusiveOperation(() => this.withStoreLock(async () => {
       const temporaryDirectory = await mkdtemp(
         join(this.directory, '.state-checkpoint-export-'),
       )
@@ -1418,7 +1473,7 @@ export class PersistentBlockProcessor {
           await rm(temporaryDirectory, { recursive: true, force: true })
         }
       }
-    })
+    }))
   }
 
   async getStorage(

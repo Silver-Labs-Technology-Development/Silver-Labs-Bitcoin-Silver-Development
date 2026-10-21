@@ -1,6 +1,6 @@
 # BTCS L2 — Deposit Reorg Accounting (v0.1)
 
-Status: **PROTOTYPE — accounting, canonical spend tracing, and conservative reorg classification IMPLEMENTED and tested; cross-process recovery coordination PARTIAL**.
+Status: **PROTOTYPE — accounting, canonical spend tracing, conservative reorg classification, and local cross-process recovery coordination IMPLEMENTED and tested; source-specific fungible-credit attribution and multi-host coordination PARTIAL**.
 Task: `BTCS-L2-SECURITY-001` (see `docs/WORK-QUEUE.md`).
 Source: `execution/evm/src/depositReorgAccounting.ts`,
 tests: `execution/evm/tests/depositReorgAccounting.test.ts`.

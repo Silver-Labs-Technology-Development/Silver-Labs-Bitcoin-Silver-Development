@@ -300,7 +300,7 @@ export async function recoverDepositReorg(
   }>,
 ): Promise<DepositReorgRecoveryResult> {
   const result = await input.processor.withDepositRecoveryLock(
-    async (view): Promise<DepositReorgRecoveryResult> => {
+    async (view, adoptReDerivedStore): Promise<DepositReorgRecoveryResult> => {
     const invalidated = normalizeInvalidated(input.invalidatedDepositIds)
     const { dropped } = selectDroppedCredits(view, invalidated)
 
@@ -334,13 +334,12 @@ export async function recoverDepositReorg(
       invalidatedDepositIds: invalidated,
       outputDirectory: input.outputDirectory,
     })
+    await adoptReDerivedStore(report.outputDirectory)
     return { status: 're-derived', gate, report }
     },
   )
 
   if (result.status === 'no-recovery-needed') return result
-
-  await input.processor.adoptReDerivedStore(result.report.outputDirectory)
   return { ...result, gate: undefined }
 }
 

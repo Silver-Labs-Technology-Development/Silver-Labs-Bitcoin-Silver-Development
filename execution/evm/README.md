@@ -49,13 +49,23 @@ It is a local chain format containing EthereumJS block/header encodings; the
 custom chain rules do not make it an Ethereum-network-compatible chain.
 
 The local parser caps serialized block RLP at 16,777,216 bytes, a JSON block
-record at 67,108,864 bytes, and transactions per block at 4,096. One writer
-process per chain directory is assumed; the instance serializes its own append
-operations, but there is no cross-process writer lock. Content-addressed block
-files written before a failed tip update are ignored unless reachable from the
-canonical tip. Reopening follows only the ancestry named by `chain.json` and
-reexecutes it from genesis; it does not scan unrelated records or detect
-corruption in orphans.
+record at 67,108,864 bytes, and transactions per block at 4,096. Processes that
+share one chain directory coordinate through `.btcs-l2-chain-write.lock`.
+Initialization, canonical writes, read snapshots, checkpoint export, and full
+deposit recovery take the lock and refresh `chain.json` before proceeding. The
+default wait limit is five minutes and can be changed with
+`chainDirectoryLockTimeoutMs` when opening the processor. This requires a local
+filesystem with reliable exclusive file creation, atomic rename, and sync; it
+does not support multi-host or distributed-filesystem coordination. A detected
+stale or malformed lock fails closed. After a crash, verify that the recorded
+owner is stopped and remove the lock file manually; stale locks are never
+removed automatically. Content-addressed block files written before a failed
+tip update are ignored unless reachable from the canonical tip. Reopening
+follows only the ancestry named by `chain.json` and reexecutes it from genesis;
+it does not scan unrelated records or detect corruption in orphans. The
+synchronous `processor.tip` getter is the last tip refreshed by that instance;
+use an asynchronous read view before relying on a tip another process may have
+advanced.
 
 Each record and the tip metadata is written through a same-directory temporary
 file, file `fsync`, atomic rename, and containing-directory `fsync`. The block
@@ -238,7 +248,8 @@ npm run e2e:deposit
 
 ### Expected side effects
 
-- Mines 101 regtest blocks to create spendable test coins, broadcasts one
+- Mines 201 regtest blocks to create spendable test coins (BTCS Core's
+  coinbase maturity is 200 blocks), broadcasts one
   regtest deposit transaction, then mines 2 further confirmation blocks.
 - Persists the dedicated Core data directory, the `btcs-l2-deposit-e2e`
   wallet, and its cookie across runs; the runner does not delete them.
@@ -253,6 +264,8 @@ npm run e2e:deposit
   -regtest -datadir="$HOME/.local/share/btcs-l2-deposit-regtest-20261011" \
   -rpcport=29445 stop
 ```
+
+Recorded live run: [regtest deposit-to-settlement results](../../docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md).
 
 ### Unresolved issues
 
@@ -330,15 +343,13 @@ spent the removed credit — re-derivation throws a typed
 `output-directory-not-usable`) and the partial output store is removed. No
 replacement chain is fabricated.
 
-recoverDepositReorg({ processor, invalidatedDepositIds, outputDirectory })
-coordinates operator recovery under the source processor's exclusive operation
-queue. It captures a fresh canonical view while holding the same queue used by
-buildNextBlock and acceptBlock. When a requested deposit is credited, it writes
-the fail-closed gate before releasing the queue, then attempts re-derivation.
-An extension already in progress finishes first and is included in the view;
-queued extensions wait and then observe the gate. This synchronization is
-in-process and scoped to one processor instance; independent processes sharing
-a chain directory are not coordinated.
+`recoverDepositReorg({ processor, invalidatedDepositIds, outputDirectory })`
+coordinates operator recovery under the source processor's in-process queue and
+OS chain-directory lock. It captures a fresh canonical view under both locks.
+When a requested deposit is credited, it writes the fail-closed gate and keeps
+both locks through re-derivation and adoption. Competing processes wait and then
+see the recovered chain or the persisted gate. An extension that commits first
+is included in the recovery view.
 
 ### Enforced gate
 
@@ -356,12 +367,12 @@ separate fresh store, which has no gate marker and is therefore open. The
 operator recovery flow copies verified re-derived records into the frozen
 source, commits the new canonical tip by atomically replacing `chain.json`, and
 clears the gate only after that commit. A pre-commit failure leaves the previous
-tip frozen and the candidate store available for retry. Recovery coordination
-is in-process and scoped to one processor instance; independent processes
-sharing a chain directory are not coordinated.
+tip frozen and the candidate store available for retry. The file lock coordinates
+cooperating processes on one local filesystem. It does not provide multi-host
+leases or protect against direct filesystem edits.
 
 **Still partial:** source-specific attribution among fungible credits,
-cross-process recovery coordination, and any network/L1 watcher action. See
+automatic L1 watcher action, and multi-host coordination. See
 `docs/DEPOSIT-REORG-RECOVERY-v0.1.md`.
 
 ## Fixed execution assumptions

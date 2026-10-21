@@ -38,6 +38,9 @@ import {
 } from '../src/settlementBatchReplay.js'
 
 const WALLET_NAME = 'btcs-l2-deposit-e2e'
+// BTCS Core sets COINBASE_MATURITY to 200; the extra block makes the first
+// generated reward spendable when the deposit transaction is constructed.
+const REGTEST_COINBASE_MATURITY = 200
 
 export class PreflightError extends Error {
   constructor(message: string) {
@@ -333,8 +336,14 @@ async function main(): Promise<void> {
     WALLET_NAME,
   )
 
-  console.log('3/9 Mining 101 local regtest blocks for spendable test funds')
-  coreCliJson<string[]>(config, 'generatetoaddress', ['101', minerAddress])
+  const fundingBlocks = REGTEST_COINBASE_MATURITY + 1
+  console.log(
+    `3/9 Mining ${fundingBlocks} local regtest blocks for spendable test funds`,
+  )
+  coreCliJson<string[]>(config, 'generatetoaddress', [
+    fundingBlocks.toString(10),
+    minerAddress,
+  ])
 
   const depositAddress = coreCli(
     config,

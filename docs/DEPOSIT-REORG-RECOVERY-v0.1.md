@@ -1,9 +1,10 @@
 # BTCS L2 — Deposit Reorg Recovery (v0.1)
 
-Status: **PROTOTYPE — canonical re-derivation, adoption, and conservative
-address-level spend evidence IMPLEMENTED and tested; cross-process coordination
-PARTIAL**.
-Task: `BTCS-L2-SECURITY-002` (see `docs/WORK-QUEUE.md`).
+Status: **PROTOTYPE — canonical re-derivation, adoption, conservative
+address-level spend evidence, and local cross-process coordination IMPLEMENTED
+and tested**.
+Tasks: `BTCS-L2-SECURITY-002` and `BTCS-L2-SECURITY-006` (see
+`docs/WORK-QUEUE.md`).
 Source: `execution/evm/src/depositReorgRecovery.ts`,
 `execution/evm/src/depositRecoveryGate.ts`,
 enforcement: `execution/evm/src/blockProcessor.ts`,
@@ -28,7 +29,8 @@ In scope:
 Out of scope (not implemented here, do not assume):
 
 - Proving that a fungible outflow was funded by one specific credit.
-- Coordinating recovery across independent OS processes sharing one store.
+- Coordinating writers on different hosts or filesystems without reliable
+  exclusive-create semantics.
 - Any L1 write, broadcast, signature, or protocol/consensus change.
 - A trustless L1 inclusion proof (verification still uses a trusted local Core
   RPC).
@@ -91,18 +93,24 @@ no replacement chain is fabricated.
 
 ## 5. Enforced, persisted gate
 
-recoverDepositReorg({ processor, invalidatedDepositIds, outputDirectory })
-is the operator entry point. It takes the source PersistentBlockProcessor rather
-than a previously captured view. It runs under the same exclusive operation
-queue as buildNextBlock and acceptBlock, captures the canonical view while
-holding that queue, and, when a requested deposit is credited, writes the gate
-before releasing it. An extension already in progress finishes first and is
-included in the view; queued or later extensions wait and then observe the gate.
-Re-derivation stays inside the queue, so it cannot race with an extension through
-this processor instance. Independent processes sharing the directory are not
-coordinated by this in-process lock and are outside the prototype's supported
-operating model. On success the report is returned; on failure the source store
+`recoverDepositReorg({ processor, invalidatedDepositIds, outputDirectory })` is
+the operator entry point. It takes the source `PersistentBlockProcessor` rather
+than a previously captured view. It holds both the instance queue and the
+chain-directory OS lock from snapshot capture through gate persistence,
+re-derivation, and adoption. Writers opened by independent Node processes use
+the same lock. Every locked operation refreshes `chain.json` before replay or
+mutation, so a long-lived processor cannot append against a stale tip. An
+extension that acquires the lock first finishes and is included in the snapshot;
+if recovery acquires it first, later extensions wait and observe the gate. On
+success adoption commits before the gate is cleared; on failure the source store
 stays frozen.
+
+The synchronous `processor.tip` getter reports the last tip refreshed by that
+processor instance. Call an asynchronous read view, replay, or write before
+using the tip after another process may have written. Use one local filesystem
+whose exclusive file creation, atomic rename, and sync operations work as
+expected. Distributed/network filesystems and multi-host writers are outside the
+prototype's supported model.
 
 The gate is enforced in both public canonical tip-advancing entry points of
 `PersistentBlockProcessor`: `buildNextBlock` (including the RPC `btcs_dev_mine` →
@@ -151,13 +159,31 @@ Does **not** prove:
 - Source-specific attribution among fungible native-asset credits. SECURITY-005
   traces address outflows, fees, and selfdestructs; an outflow is treated as
   potentially spent even when unrelated funds could have covered it.
-- Cross-process safety for multiple writers sharing one chain directory.
+- Multi-host or distributed-filesystem coordination, lock leasing, and automatic
+  stale-lock takeover.
 - Any production bridge, vault, withdrawal, or proof security.
 
 ## 7. Follow-up
 
-1. Coordinate the recovery gate and canonical writes across independent OS
-   processes before sharing a chain directory.
-2. Extend the gate to the settlement/production paths beyond block extension if a
+1. Extend the gate to settlement and production paths beyond block extension if a
    running settlement service is added.
-3. Add a multi-implementation convergence test (whitepaper §49 acceptance).
+2. Add a multi-implementation convergence test (whitepaper §49 acceptance).
+
+## 8. Local chain-directory lock
+
+`PersistentBlockProcessor` uses the exclusive file
+`.btcs-l2-chain-write.lock` in the chain directory. Initialization, canonical
+extension/import, read snapshots, checkpoint export, and the complete recovery
+freeze/re-derive/adopt flow take this lock. The default wait limit is five
+minutes; callers can set `chainDirectoryLockTimeoutMs` when opening a processor.
+The lock owner file records host, PID, start time, and a random token; it contains
+no RPC credentials.
+
+Timeouts, malformed lock records, and a detected stopped local owner fail
+closed. The code does not remove an uncertain lock automatically. After verifying
+that its process is stopped, an operator may remove the lock file manually. A
+crash can therefore require manual lock cleanup before the chain can resume.
+Tests cover independent Node processes racing to append, stale-tip refresh, and
+stale/malformed locks leaving canonical metadata unchanged. This coordinates
+processes that honor this file lock; it is not consensus, a lease, or protection
+against arbitrary filesystem edits.
