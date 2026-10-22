@@ -177,6 +177,8 @@ if(ENABLE_WALLET)
       openuridialog.h
       overviewpage.cpp
       overviewpage.h
+      silverforgepage.cpp
+      silverforgepage.h
       paymentserver.cpp
       paymentserver.h
       psbtoperationsdialog.cpp
