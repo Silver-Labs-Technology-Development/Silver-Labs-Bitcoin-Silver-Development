@@ -279,7 +279,7 @@ function encodeSnapshot(records: ReadonlyMap<string, BtcsL1DepositRecord>): Uint
     format: BTCS_L1_DEPOSIT_STORE_FORMAT,
     version: BTCS_L1_DEPOSIT_STORE_VERSION,
     records: [...records.values()]
-      .sort((a, b) => a.depositId.localeCompare(b.depositId))
+      .sort((a, b) => (a.depositId < b.depositId ? -1 : a.depositId > b.depositId ? 1 : 0))
       .map(cloneRecord),
   }
   if (snapshot.records.length > MAX_RECORDS) {
@@ -436,7 +436,7 @@ export class BtcsL1DepositStore {
   list(): readonly BtcsL1DepositRecord[] {
     this.assertUsable()
     return [...this.records.values()]
-      .sort((a, b) => a.depositId.localeCompare(b.depositId))
+      .sort((a, b) => (a.depositId < b.depositId ? -1 : a.depositId > b.depositId ? 1 : 0))
       .map(cloneRecord)
   }
 

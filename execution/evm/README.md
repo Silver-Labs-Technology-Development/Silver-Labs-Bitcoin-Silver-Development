@@ -251,12 +251,42 @@ fragment transactions may remain in the mempool without an anchor or complete
 data set. The recorded run is saved at
 [`docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md`](../../docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md).
 
+`inspectBtcsL1BatchDataAvailability` rescans a configured active-chain range and
+tracks the expected anchor transaction and each expected fragment transaction.
+It reports `incomplete`, `awaiting-confirmations`, or `available`. The available
+state requires every expected transaction in the active chain, the configured
+confirmation count for all of them, a matching anchor, and successful byte-for-
+byte reconstruction against the trusted starting anchors and batch hash. To
+avoid reporting from a mixed chain state, the scan records the active tip height
+and hash before scanning and re-reads both after: a changed tip height (a chain
+extension or shortening) or a changed tip hash (a same-height reorganization)
+fails closed with `ProtocolError` instead of returning a report. Because the tip
+block commits to its whole ancestry, re-checking the tip hash also catches a
+change to an already-scanned block. The scan also fails closed when it exceeds
+10,000 blocks/100,000 outputs. This is a stateless read: after a process restart, call
+it again with the same batch hash, transaction IDs, scan start height, and
+confirmation policy. Keep the previous report if the caller also needs an
+explicit list of transactions orphaned or re-included since the last poll.
+There is no bundled timer or daemon service; schedule repeated calls in the
+supervising process or external service. Concurrent scans are read-only and
+need no stale-lock recovery.
+
+An opt-in destructive regtest scenario is available by setting
+`BTCS_L2_BATCH_DATA_REGTEST_REORG_TEST=1` along with port `29446`, datadir
+`~/.local/share/btcs-l2-regtest-reorg-20261011`, and wallet
+`btcs-l2-reorg-test`. The runner refuses other values. It invalidates only the
+new publication block it just mined in that dedicated test chain, verifies the
+publication becomes incomplete, then rebroadcasts/re-mines the same data and
+checks the replacement inclusion and reconstruction. Do not point this mode at
+another chain. It does not start or stop Core.
+
 Reconstruction accepts only the Core blocks supplied by the caller. Fetch them
 by active-chain hash and apply the desired confirmation policy first. The
 fragment decoder rejects missing indexes, duplicates, conflicting metadata,
 noncanonical bytes, incorrect trusted anchors, and a batch hash mismatch. It is
 not an SPV proof, does not itself track reorgs, and does not establish data
-availability after an L1 reorganization.
+availability by itself; call the active-chain availability inspector to
+recompute status after each reorg or restart.
 
 <a id="regtest-deposit-settlement-e2e"></a>
 

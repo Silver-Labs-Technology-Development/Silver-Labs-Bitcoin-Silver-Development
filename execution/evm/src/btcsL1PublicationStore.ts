@@ -117,7 +117,7 @@ function encodeSnapshot(
     format: BTCS_L1_PUBLICATION_STORE_FORMAT,
     version: BTCS_L1_PUBLICATION_STORE_VERSION,
     records: [...records.values()]
-      .sort((a, b) => a.batchHash.localeCompare(b.batchHash))
+      .sort((a, b) => (a.batchHash < b.batchHash ? -1 : a.batchHash > b.batchHash ? 1 : 0))
       .map(cloneRecord),
   }
 
@@ -281,7 +281,7 @@ export class BtcsL1PublicationStore {
   list(): readonly BtcsL1PublicationRecord[] {
     this.assertUsable()
     return [...this.records.values()]
-      .sort((a, b) => a.batchHash.localeCompare(b.batchHash))
+      .sort((a, b) => (a.batchHash < b.batchHash ? -1 : a.batchHash > b.batchHash ? 1 : 0))
       .map(cloneRecord)
   }
 

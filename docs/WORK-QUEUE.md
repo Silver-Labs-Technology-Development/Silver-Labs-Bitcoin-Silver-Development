@@ -18,7 +18,37 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 | BTCS-L2-L1-001 | Reproducible real regtest settlement-anchor publication | READY_FOR_REVIEW | execution/evm/package.json, execution/evm/scripts/regtest-anchor-e2e.ts, execution/evm/README.md, docs/REGTEST-ANCHOR-E2E-RESULTS-2026-10-21.md | Node v24.17.0 npm run e2e:anchor PASS: signed transaction with exactly one expected anchor was mempool-accepted, confirmed at block 305, independently matched the 2-block batch commitment, and the confirmed publication record survived store reopen. Batch body was not published. |
 | BTCS-L2-L1-002 | Poll configured L1 deposit outputs and reconcile reorgs | READY_FOR_REVIEW | execution/evm/src/btcsL1DepositWatcher.ts, execution/evm/src/btcsL1DepositWatchStore.ts, execution/evm/src/btcsL1DepositStore.ts, execution/evm/src/btcsL1CoreRpc.ts, execution/evm/tests/btcsL1DepositWatcher.test.ts, execution/evm/README.md | Node v24.17.0 typecheck passes; watcher tests 7/7; integrated EVM suite 236/236. Lifetime OS locks cover cursor and deposit store; durable bounded cursor, confirmed-only records, shallow-reorg invalidation/re-inclusion, temporary RPC fail-safe, and deep-reorg stop are implemented. Watcher reports invalidated IDs; operator invokes L2 recovery. |
 | BTCS-L2-L1-003 | Publish and reconstruct settlement batch data from L1 | READY_FOR_REVIEW | execution/evm/src/btcsL1BatchData.ts, execution/evm/tests/btcsL1BatchData.test.ts, execution/evm/scripts/regtest-batch-data-e2e.ts, execution/evm/package.json, execution/evm/README.md, docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md | Live Node v24.17.0 regtest PASS: 4,472 canonical batch bytes published as 128 fragments plus the matching commitment; all transactions confirmed in block 507; reconstruction from Core block outputs matched exact bytes and existing batch hash. Codec/reconstruction tests 6/6; full EVM suite 242/242; typecheck passes. |
-| BTCS-L2-L1-004 | Reorg-aware L1 publication data and watcher operation | READY_FOR_AGENT | execution/evm/src/btcsL1BatchData.ts, execution/evm/src/btcsL1DepositWatcher.ts, execution/evm/tests/, execution/evm/scripts/, docs/ | Track fragment and anchor inclusion through confirmations and reorgs; ensure incomplete/orphaned data cannot be treated as available, re-observe replacement inclusions, and record a regtest reorg/reconstruction result. Define restart, stale-lock recovery, and scheduled polling behavior without claiming a production service. |
+| BTCS-L2-L1-004 | Reorg-aware L1 publication data and watcher operation | READY_FOR_REVIEW | execution/evm/src/btcsL1BatchDataAvailability.ts, execution/evm/tests/btcsL1BatchDataAvailability.test.ts, execution/evm/scripts/regtest-batch-data-e2e.ts, execution/evm/README.md, docs/ | A stateless bounded active-chain scan tracks expected anchor/fragments, confirmation depth, and exact reconstruction; it now brackets every scan with an active tip-height and tip-hash re-read and fails closed on a chain extension (height change) or same-height reorganization, so no `available` report can mix two chain states. Deterministic auto tests pass on Node v24.17.0: typecheck clean, focused suite 5/5 (confirmation waiting, orphan reporting, replacement re-inclusion, tip-height extension, same-height reorg), full EVM suite 247/247. A dedicated opt-in regtest (`BTCS_L2_BATCH_DATA_REGTEST_REORG_TEST=1`) live run PASSED on the disposable reorg node (RPC 29446, datadir `btcs-l2-regtest-reorg-20261011`, wallet `btcs-l2-reorg-test`): a 4,472-byte / 128-fragment batch was published and confirmed at L1 height 555, the publication branch was invalidated, the scanner reported `incomplete` with all 129 expected txs orphaned, and the replacement branch re-included all 129 txs with byte-exact reconstruction (orphan count 129 = re-inclusion count 129). Restart recomputes from active Core data; polling cadence remains caller/supervisor controlled. |
+
+## Mandate priority run — 2026-10-21 (autonomous)
+
+| Priority | Task | Status | Evidence |
+|---|---|---|---|
+| P1 | Checkpoint vs whitepaper v1.2 audit + hardening | COMPLETE | Node v24.17.0 `npm run typecheck` clean; full suite 248/248. Adoption defense-in-depth guard added in `PersistentBlockProcessor.adoptReDerivedStoreUnlocked` (refuses a re-derived candidate that still credits a frozen deposit). Deterministic store ordering: `localeCompare` replaced with code-unit comparison in `btcsL1PublicationStore.ts` and `btcsL1DepositStore.ts`. Regression test added to `depositReorgRecovery.test.ts`. |
+| P2 | Real Core regtest deposit flow | COMPLETE | `npm run e2e:deposit` PASS on a fresh isolated `build-noipc` node (RPC 29450): deposit `add1502ed51db1ad9c67120515fa1788bafa161767a856242a60ee7b86c9733d:0`, L1 height 202, 2 confirmations, credited `100000000000000000` wei, state root `0x680666…a9f9b`. See `docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md`. |
+| P3 | Deposit reorg recovery scenarios | PARTIAL | Unit recovery/gate/accounting suites green (adoption refusal, freeze, re-derive, re-inclusion, mixed deposits, cross-reopen), plus new adoption-refusal test. Destructive real-Core reorg remains deferred (see Blockers). |
+| P4 | L1 settlement publication + independent reconstruction | COMPLETE | `npm run e2e:batch-data` PASS (batch `c31e6c18…`, 128 fragments, 4,472 bytes reconstructed byte-exact, commitment at L1 height 402) and `npm run e2e:anchor` PASS (confirmed at height 204, publication recovered after store reopen). Plus a live destructive reorg run PASS on the disposable node (batch `aae918c8…`, 129 orphaned → 129 re-included, byte-exact). See results doc. |
+| P5 | Integrated prototype workflow / runbook | COMPLETE | `docs/INTEGRATED-PROTOTYPE-RUNBOOK.md` (validated deposit → execution → batch-data → anchor → reorg commands and environment caveats). |
+
+### Deliverables produced (2026-10-21)
+
+- `docs/INTEGRATED-PROTOTYPE-RUNBOOK.md` — end-to-end prototype runbook.
+- `docs/SECURITY-GAP-REGISTER.md` — honest security/safety gap inventory (SG-01…SG-12).
+- `docs/PRIVATE-TESTNET-RELEASE-READINESS.md` — private-testnet/release checklist.
+- `docs/REQUIREMENTS-IMPLEMENTATION-MATRIX-v1.2.md` — whitepaper v1.2 requirements→implementation mapping.
+- `docs/REGTEST-DEPOSIT-SETTLEMENT-E2E-RESULTS-2026-10-21.md` — updated with fresh-node deposit, batch-data, anchor, and reorg live evidence.
+
+### Regtest harness environment findings (2026-10-21)
+
+- **`e2e:batch-data` requires a wallet funded with ≥ fragments+1 mature confirmed UTXOs.** It publishes ~129 independent `minconf:1` transactions; after the first spend the only fresh coin is unconfirmed change, so a thinly-funded wallet fails partway with the misleading Core error `The total exceeds your balance when the … fee is included` even though `getbalances.mine.trusted` is large and `listunspent` is empty. Mitigation used: mature 201 coinbases (tip 401). Recommended hardening: have the runner assert/auto-provision enough mature UTXOs.
+- **No Core build divergence (earlier hypothesis corrected).** `fundrawtransaction {"minconf":1,"fee_rate":2}` works on both the `build/bin` and `build-noipc` daemons once confirmed UTXOs exist (re-verified on `build-noipc`, RPC 29450). The earlier "build" difference was a misdiagnosis of wallet state. Real requirement: a fee source. `e2e:anchor` (no fee options, line 165) and `e2e:deposit` need `-fallbackfee` when fee estimation is unavailable (e.g. the `build/bin` node on 29443 fails with `Fee estimation failed`); `e2e:batch-data` passes an explicit `fee_rate` and instead needs confirmed UTXOs (previous bullet).
+- `COINBASE_MATURITY = 200`; funding flows must mature ≥ 201 coinbases before spending.
+- **Harness timeout fragility (fixed).** After mining a block that contains ~129 wallet transactions, the wallet endpoint can exceed the `regtest-batch-data-e2e.ts` 15s RPC timeout on a slow daemon: `getnewaddress` timed out reproducibly right after mining. The script's long-timeout set was extended to cover `getnewaddress` and `getwalletinfo` (orchestration timeouts only; no assertion or validation gate was relaxed).
+
+### Blockers
+
+- `e2e:anchor` reorg mode live evidence captured on 29444 (datadir `btcs-l2-regtest-reorg-20261011`, store `btcs-l2-regtest-reorg-publications-20261011`, wallet `btcs-l2-reorg-test`): original publication invalidated and removed from active chain, state persisted/reopened after invalidation, replacement branch re-included the anchor tx and was confirmed (batch `ebdaabe2…`, confirmed at L1 height 556 in replacement block `18a37616…`). Node had to be unloaded/reloaded between steps because it held no wallet on fresh start.
+- Withdrawals/exit security, censorship resistance, and the fraud/validity proof architecture are blocked on an unresolved protocol decision; no mechanism should be invented.
 
 ## Acceptance criteria
 
@@ -66,6 +96,15 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 - The live result file records Core identifiers, fragment count/size, transaction inclusion, and explicit limits; no reorg or production data-availability claim is made.
 - Tests cover encoding, round-trip reconstruction, ordering, missing/duplicate/tampered fragments, incorrect anchors/hash, unrelated OP_RETURN data, and scan bounds.
 - Node v24.17.0 typecheck passes; the focused batch-data codec/reconstruction suite passes 6/6; live regtest publication and reconstruction pass as recorded in `docs/REGTEST-BATCH-DATA-E2E-RESULTS-2026-10-21.md`.
+
+### BTCS-L2-L1-004
+
+- Availability is `available` only when the anchor and every expected fragment transaction are found on the active chain, each meets the configured confirmation threshold, and canonical batch reconstruction matches the trusted start anchors and batch hash.
+- Missing or orphaned publication transactions yield `incomplete`; present but shallow inclusions yield `awaiting-confirmations`. Re-included transactions are revalidated at their replacement block and confirmations are recomputed.
+- The bounded scanner fails closed if the chain changes during inspection (either the active tip height or the active tip hash differs when re-read after the scan) or the configured scan exceeds 10,000 blocks/100,000 outputs. Re-checking the tip hash at an unchanged tip height also proves no already-scanned block changed, because the tip commits to its ancestry. It uses trusted loopback Core RPC and does not claim SPV proofs or production finality.
+- Restart behavior is stateless: re-run with the same expected transaction IDs, batch hash, start height, and confirmation target. Previous report data is optional and used only to list orphaned/reorganized transaction IDs. There is no bundled timer; the caller or external supervisor schedules repeated polls. The scanner is read-only and has no lock to recover.
+- Unit tests cover confirmation waiting, full reconstruction, reorg invalidation, orphan reporting, replacement inclusion, renewed availability, a tip-height extension during a scan, and a same-height reorganization during a scan. Deterministic auto evidence (Node v24.17.0): typecheck clean, focused suite 5/5, full EVM suite 247/247. A dedicated opt-in regtest result records the invalidated and replacement block hashes, transaction counts, reconstruction result, and limits: on the disposable reorg node the orphaned publication block was invalidated (129 expected txs orphaned) and the replacement block re-included all 129 with byte-exact reconstruction, so L1-004 now has live reorg evidence.
+- Node v24.17.0 typecheck and the integrated suite must pass; the live reorg scenario is restricted to the dedicated test port/datadir/wallet.
 
 ### BTCS-L2-SECURITY-001
 
@@ -148,3 +187,20 @@ Purpose: Track tasks, saved deliverables, reviews, and next steps.
 - READY_FOR_REVIEW: Deliverables are saved and await review.
 - BLOCKED: Work cannot continue without resolving a dependency.
 - COMPLETE: Reviewed and accepted.
+
+## BSNA Standard (Proposed - Future)
+- [ ] BSNA-001: BSNA Technical Specification v1.0 (PROPOSED)
+- [ ] BSNA-002: ERC-20/721 reference implementations with IBSNA interface (PROPOSED)
+- [ ] BSNA-003: Conformance tests and fixtures (PROPOSED)
+- [ ] BSNA-004: Explorer/wallet recognition (PROPOSED)
+- [ ] BSNA-005: BTCS Core integration (PROPOSED - no consensus changes)
+- [ ] BSNA-006: Versioning/governance/conformance policy (PROPOSED)
+
+## BSNA-20 / BSNA-721 Profiles (Proposed)
+- [ ] BSNA-20-001: BSNA-20 specification finalization (PROPOSED)
+- [ ] BSNA-20-002: BSNA-20 reference contract with IBSNA interface (PROPOSED)
+- [ ] BSNA-20-003: BSNA-20 conformance tests (PROPOSED)
+- [ ] BSNA-721-001: BSNA-721 specification finalization (PROPOSED)
+- [ ] BSNA-721-002: BSNA-721 reference contract with IBSNA interface (PROPOSED)
+- [ ] BSNA-721-003: BSNA-721 conformance tests (PROPOSED)
+- [ ] BSNA-INT-001: Silver Forge integration for both profiles (PROPOSED)

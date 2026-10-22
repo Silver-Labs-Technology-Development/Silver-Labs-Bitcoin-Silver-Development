@@ -1292,6 +1292,26 @@ export class PersistentBlockProcessor {
     if (candidate.genesisHashValue !== this.genesisHashValue) {
       throw new ProtocolError('re-derived store genesis does not match the canonical store')
     }
+
+    // Defense in depth: a re-derived store may be adopted through this public
+    // entry point without going through `recoverDepositReorg`. Refuse any
+    // candidate that still credits a deposit the freeze holds responsible, so
+    // adoption can never reopen the store while an invalidated credit remains.
+    const candidateView = await candidate.createCanonicalReadView()
+    const frozenDepositIds = new Set(gate.involvedDepositIds)
+    if (frozenDepositIds.size > 0) {
+      const candidateTipNumber = candidateView.report.tip.number
+      for (let height = 0n; height <= candidateTipNumber; height += 1n) {
+        for (const operation of candidateView.getCanonicalDepositOperations(height)) {
+          if (frozenDepositIds.has(operation.depositId)) {
+            throw new ProtocolError(
+              're-derived store still credits a deposit involved in the recovery freeze',
+            )
+          }
+        }
+      }
+    }
+
     const records = await candidate.loadCanonicalRecords()
     for (const { record } of records) {
       await persistContentAddressedRecord(

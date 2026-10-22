@@ -1004,3 +1004,7 @@ export async function startLocalRpcServer(
     }),
   }
 }
+
+// Withdrawal RPC methods
+import { WithdrawalService } from './withdrawalService.js'
+import { L1PayoutAdapter } from './l1PayoutAdapter.js'

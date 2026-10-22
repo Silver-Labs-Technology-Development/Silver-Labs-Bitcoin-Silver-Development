@@ -25,10 +25,13 @@ import {
   recoverDepositReorg,
 } from '../src/depositReorgRecovery.js'
 import {
+  DEPOSIT_RECOVERY_GATE_FORMAT,
+  DEPOSIT_RECOVERY_GATE_VERSION,
   DepositRecoveryGateError,
   clearDepositRecoveryGate,
   depositRecoveryGatePath,
   readDepositRecoveryGate,
+  writeDepositRecoveryGate,
 } from '../src/depositRecoveryGate.js'
 import {
   BTCS_L1_DEPOSIT_RECORD_FORMAT,
@@ -652,6 +655,53 @@ test('isolated replay into a fresh store still works while recovery has frozen t
     )
     assert.equal(processed.summary.number, '2')
     assert.equal(fresh.tip.number, 2n)
+  })
+})
+
+test('adoption refuses a candidate that still credits a deposit involved in the freeze', async () => {
+  await fixture(async ({ root, sourceDirectory, chain }) => {
+    const operation = createEvmDepositOperation(recordFor())
+    await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [operation])
+    const originalTip = { ...chain.tip }
+
+    // A valid candidate store (same genesis) that still credits the frozen deposit.
+    const block1 = await chain.getCanonicalBlockByNumber(1n)
+    assert.ok(block1)
+    const candidateDirectory = join(root, 'candidate')
+    const candidate = await PersistentBlockProcessor.open(candidateDirectory)
+    await candidate.acceptBlock(
+      hexToBytes(block1.blockRlpHex as `0x${string}`),
+      [operation],
+    )
+
+    await writeDepositRecoveryGate(sourceDirectory, {
+      format: DEPOSIT_RECOVERY_GATE_FORMAT,
+      version: DEPOSIT_RECOVERY_GATE_VERSION,
+      status: 'frozen',
+      reason: 'test freeze',
+      involvedDepositIds: [operation.depositId],
+      rederiveFromBlock: '1',
+      engagedAtHeight: '1',
+    })
+
+    await assert.rejects(
+      chain.adoptReDerivedStore(candidateDirectory),
+      (error: unknown) => {
+        assert.ok(error instanceof ProtocolError)
+        assert.match(error.message, /still credits a deposit involved in the recovery freeze/)
+        return true
+      },
+    )
+
+    // The freeze and canonical tip are unchanged; adoption never mutated the source.
+    assert.equal((await readDepositRecoveryGate(sourceDirectory))?.status, 'frozen')
+    assert.deepEqual(chain.tip, originalTip)
+    const view = await chain.createCanonicalReadView()
+    assert.equal(view.report.tip.hash, originalTip.hash)
+    assert.deepEqual(
+      collectCanonicalDepositCredits(view).map((credit) => credit.depositId),
+      [operation.depositId],
+    )
   })
 })
 
