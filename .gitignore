@@ -1,3 +1,5 @@
 .regtest/
 *.log
 __pycache__/
+
+studio/node_modules/
