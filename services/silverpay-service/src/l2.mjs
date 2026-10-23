@@ -1,24 +1,66 @@
+import {
+  BTCS_L2_LOCAL,
+  BtcsL2ClientError,
+  createBtcsL2Client,
+  JsonRpcError,
+  NetworkIdentityValidationError,
+  NetworkMismatchError,
+  RpcProtocolError,
+  RpcTransportError,
+  UnsupportedNetworkIdentitySchemaError,
+  UnsupportedNetworkProfileError,
+} from '@silver-labs/btcs-l2-client'
 import { UpstreamError } from './rpc.mjs'
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
-const QUANTITY_RE = /^0x(?:0|[1-9a-f][0-9a-f]*)$/i
 
-function parseQuantity(value, label) {
-  if (typeof value !== 'string' || !QUANTITY_RE.test(value)) {
-    throw new UpstreamError('invalid_response', `${label} is not a hex quantity`)
-  }
-  const numeric = BigInt(value)
-  if (numeric > BigInt(Number.MAX_SAFE_INTEGER)) {
+function toSafeNumber(value, label) {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new UpstreamError('invalid_response', `${label} exceeds the safe integer range`)
   }
-  return Number(numeric)
+  return Number(value)
 }
 
-function parseHexString(value, label) {
-  if (typeof value !== 'string' || !/^0x[0-9a-f]*$/i.test(value)) {
-    throw new UpstreamError('invalid_response', `${label} is not hex data`)
+function translateClientError(error) {
+  if (error instanceof RpcTransportError) {
+    return new UpstreamError('unavailable', error.message, { cause: error })
   }
-  return value.toLowerCase()
+  if (error instanceof JsonRpcError) {
+    return new UpstreamError('rpc_error', `L2 RPC returned JSON-RPC error ${error.code}`, { cause: error })
+  }
+  if (error instanceof NetworkMismatchError) {
+    return new UpstreamError('invalid_response', 'L2 RPC identity does not match the configured BTCS L2 local profile', {
+      cause: error,
+    })
+  }
+  if (error instanceof UnsupportedNetworkIdentitySchemaError) {
+    return new UpstreamError(
+      'invalid_response',
+      `L2 RPC identity schema version ${String(error.schemaVersion)} is unsupported`,
+      { cause: error },
+    )
+  }
+  if (error instanceof UnsupportedNetworkProfileError) {
+    return new UpstreamError('invalid_response', error.message, { cause: error })
+  }
+  if (error instanceof NetworkIdentityValidationError) {
+    return new UpstreamError('invalid_response', error.message, { cause: error })
+  }
+  if (error instanceof RpcProtocolError) {
+    return new UpstreamError('invalid_response', error.message, { cause: error })
+  }
+  if (error instanceof BtcsL2ClientError) {
+    return new UpstreamError('invalid_response', error.message, { cause: error })
+  }
+  return error
+}
+
+async function fromClient(operation) {
+  try {
+    return await operation()
+  } catch (error) {
+    throw translateClientError(error)
+  }
 }
 
 export function normalizeL2Address(value) {
@@ -28,59 +70,56 @@ export function normalizeL2Address(value) {
   return value.toLowerCase()
 }
 
-export function createL2Reader(rpc) {
+export function createL2Reader({ endpoint, timeoutMs, fetchImpl, profile = BTCS_L2_LOCAL } = {}) {
+  const rpc = createBtcsL2Client({
+    endpoint,
+    profile,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(fetchImpl === undefined ? {} : { fetchImpl }),
+  })
+
   return {
     async readNetwork() {
-      const [chainIdRaw, blockNumberRaw, clientVersion, netVersion, listening] =
-        await Promise.all([
-          rpc.call('eth_chainId'),
-          rpc.call('eth_blockNumber'),
-          rpc.call('web3_clientVersion'),
-          rpc.call('net_version'),
-          rpc.call('net_listening'),
-        ])
-      const chainId = parseQuantity(chainIdRaw, 'L2 chain ID')
-      const blockNumber = parseQuantity(blockNumberRaw, 'L2 block number')
-      if (typeof clientVersion !== 'string') {
-        throw new UpstreamError('invalid_response', 'L2 client version is malformed')
-      }
-      if (typeof netVersion !== 'string') {
-        throw new UpstreamError('invalid_response', 'L2 network version is malformed')
-      }
-      if (typeof listening !== 'boolean') {
-        throw new UpstreamError('invalid_response', 'L2 listening state is malformed')
+      const identity = await fromClient(() => rpc.verifyNetwork())
+      const [blockNumberRaw, networkVersion, listening] = await fromClient(() =>
+        Promise.all([
+          rpc.getBlockNumber(),
+          rpc.getNetworkVersion(),
+          rpc.isListening(),
+        ]))
+      const chainId = BigInt(identity.chainId)
+      if (networkVersion !== identity.chainId) {
+        throw new UpstreamError('invalid_response', 'L2 network version does not match its chain ID')
       }
       return {
-        chainId,
+        chainId: toSafeNumber(chainId, 'L2 chain ID'),
         chainIdHex: `0x${chainId.toString(16)}`,
-        blockNumber,
-        clientVersion,
-        networkVersion: netVersion,
+        blockNumber: toSafeNumber(blockNumberRaw, 'L2 block number'),
+        clientVersion: identity.clientVersion,
+        networkIdentitySchemaVersion: identity.schemaVersion,
+        profileId: identity.profileId,
+        networkVersion,
         listening,
+        readOnly: true,
       }
     },
 
     async readAccount(addressValue) {
       const address = normalizeL2Address(addressValue)
-      const [balanceRaw, nonceRaw, codeRaw, blockNumberRaw] = await Promise.all([
-        rpc.call('eth_getBalance', [address, 'latest']),
-        rpc.call('eth_getTransactionCount', [address, 'latest']),
-        rpc.call('eth_getCode', [address, 'latest']),
-        rpc.call('eth_blockNumber'),
-      ])
-      if (typeof balanceRaw !== 'string' || !QUANTITY_RE.test(balanceRaw)) {
-        throw new UpstreamError('invalid_response', 'L2 account balance is not a hex quantity')
-      }
-      const balanceWei = BigInt(balanceRaw).toString(10)
-      const nonce = parseQuantity(nonceRaw, 'L2 account nonce')
-      const code = parseHexString(codeRaw, 'L2 account code')
-      const blockNumber = parseQuantity(blockNumberRaw, 'L2 block number')
+      await fromClient(() => rpc.verifyNetwork())
+      const [balance, nonceRaw, code, blockNumberRaw] = await fromClient(() =>
+        Promise.all([
+          rpc.getBalance(address),
+          rpc.getTransactionCount(address),
+          rpc.getCode(address),
+          rpc.getBlockNumber(),
+        ]))
       return {
         address,
-        balanceWei,
-        nonce,
+        balanceWei: balance.toString(10),
+        nonce: toSafeNumber(nonceRaw, 'L2 account nonce'),
         isContract: code.length > 2,
-        blockNumber,
+        blockNumber: toSafeNumber(blockNumberRaw, 'L2 block number'),
         readOnly: true,
       }
     },

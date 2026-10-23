@@ -1,6 +1,10 @@
 import { ProtocolError } from './blockProcessor.js'
 import { BTCS_L1_ANCHOR_MAGIC_HEX, decodeBtcsL1AnchorScript, encodeBtcsL1AnchorScript } from './btcsL1Anchor.js'
-import { verifyBtcsL1TxOutProof } from './l1HeaderVerifier.js'
+import {
+  verifyBtcsL1TxOutProof,
+  type BestChainSelector,
+  type LocalVerificationModel,
+} from './l1HeaderVerifier.js'
 
 export type BtcsL1ConfirmationRpc = Readonly<{
   getRawTransaction(txid: string, blockHash: string): Promise<unknown>
@@ -27,6 +31,8 @@ export type BtcsL1ConfirmationReport = Readonly<{
   verificationModel:
     | 'trusted-btcs-core-rpc'
     | 'trusted-btcs-core-rpc+local-inclusion-proof'
+    | 'local-best-chain+local-inclusion-proof'
+    | 'local-best-chain-only'
   inclusionProofVerified: boolean
   txid: string
   blockHash: string
@@ -49,7 +55,12 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 export async function verifyBtcsL1AnchorConfirmation(
   rpc: BtcsL1ConfirmationRpc,
   request: BtcsL1ConfirmationRequest,
+  options: Readonly<{
+    /** Optional locally selected best chain. When provided, the block must be a member of the locally selected chain and the RPC active-chain boolean is not treated as authority. */
+    bestChainSelector?: BestChainSelector
+  }> = {},
 ): Promise<BtcsL1ConfirmationReport> {
+  const { bestChainSelector } = options
   if (
     !HASH_RE.test(request.txid) ||
     !HASH_RE.test(request.blockHash) ||
@@ -76,7 +87,7 @@ export async function verifyBtcsL1AnchorConfirmation(
   if (tx.blockhash !== request.blockHash) {
     throw new ProtocolError('transaction is not in the requested block')
   }
-  if (tx.in_active_chain !== true) {
+  if (bestChainSelector === undefined && tx.in_active_chain !== true) {
     throw new ProtocolError('transaction is not confirmed in the active chain')
   }
   if (!Array.isArray(tx.vout)) {
@@ -140,6 +151,17 @@ export async function verifyBtcsL1AnchorConfirmation(
     throw new ProtocolError('transaction and block header confirmation counts disagree')
   }
 
+  // When a local best-chain selector is provided, require the block to be a
+  // member of the locally selected chain. The RPC active-chain boolean is not
+  // treated as authority in this mode.
+  if (bestChainSelector !== undefined) {
+    if (!bestChainSelector.isOnSelectedChain(request.blockHash)) {
+      throw new ProtocolError(
+        'block is not a member of the locally selected best chain',
+      )
+    }
+  }
+
   // When the RPC exposes gettxoutproof, require and verify a partial Merkle
   // proof locally. This catches a lying inclusion boolean or a proof for a
   // different transaction/block, but it does not make the header canonical.
@@ -169,9 +191,16 @@ export async function verifyBtcsL1AnchorConfirmation(
   return {
     format: 'btcs-l2-btcs-l1-confirmation',
     version: 1,
-    verificationModel: inclusionProofVerified
-      ? 'trusted-btcs-core-rpc+local-inclusion-proof'
-      : 'trusted-btcs-core-rpc',
+    verificationModel: (() => {
+      if (bestChainSelector !== undefined) {
+        return inclusionProofVerified
+          ? 'local-best-chain+local-inclusion-proof'
+          : 'local-best-chain-only'
+      }
+      return inclusionProofVerified
+        ? 'trusted-btcs-core-rpc+local-inclusion-proof'
+        : 'trusted-btcs-core-rpc'
+    })(),
     inclusionProofVerified,
     txid: request.txid,
     blockHash: request.blockHash,

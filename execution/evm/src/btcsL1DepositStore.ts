@@ -10,6 +10,7 @@ import {
 import { join, resolve } from 'node:path'
 import { ProtocolError } from './blockProcessor.js'
 import type { BtcsL1DepositReport } from './btcsL1Deposit.js'
+import type { BestChainSelector } from './l1HeaderVerifier.js'
 
 export const BTCS_L1_DEPOSIT_RECORD_FORMAT = 'btcs-l2-btcs-l1-deposit-record'
 export const BTCS_L1_DEPOSIT_RECORD_VERSION = 1
@@ -63,6 +64,10 @@ export type BtcsL1DepositStoreOptions = Readonly<{
   persistenceTestHook?: (
     stage: BtcsL1DepositStorePersistenceStage,
   ) => void | Promise<void>
+  /** Optional locally selected best chain. When provided, the store carries
+   *  this chain context so callers can validate persisted inclusions against
+   *  the locally selected chain across restarts. */
+  bestChainSelector?: BestChainSelector
 }>
 
 class AtomicWriteFailure extends Error {
@@ -103,7 +108,9 @@ function validateReport(
     report.format !== 'btcs-l2-btcs-l1-deposit-verification' ||
     report.version !== 1 ||
     (report.verificationModel !== 'trusted-btcs-core-rpc' &&
-      report.verificationModel !== 'trusted-btcs-core-rpc+local-inclusion-proof') ||
+      report.verificationModel !== 'trusted-btcs-core-rpc+local-inclusion-proof' &&
+      report.verificationModel !== 'local-best-chain-only' &&
+      report.verificationModel !== 'local-best-chain+local-inclusion-proof') ||
     report.activeChain !== true ||
     report.depositVerified !== true
   ) {
@@ -382,6 +389,7 @@ export class BtcsL1DepositStore {
   private records: Map<string, BtcsL1DepositRecord>
   private readonly directory: string
   private readonly persistenceTestHook?: BtcsL1DepositStoreOptions['persistenceTestHook']
+  private readonly bestChainSelector?: BestChainSelector
   private mutationQueue: Promise<void> = Promise.resolve()
   private persistenceUncertain = false
 
@@ -393,6 +401,7 @@ export class BtcsL1DepositStore {
     this.directory = directory
     this.records = records
     this.persistenceTestHook = options.persistenceTestHook
+    this.bestChainSelector = options.bestChainSelector
   }
 
   static async create(
@@ -425,6 +434,11 @@ export class BtcsL1DepositStore {
   /** Directory containing the durable store, for coordinating cooperating watchers. */
   get directoryPath(): string {
     return this.directory
+  }
+
+  /** The locally selected best chain carried by this store, if any. */
+  get selectedBestChain(): BestChainSelector | undefined {
+    return this.bestChainSelector
   }
 
   get(depositId: string): BtcsL1DepositRecord | undefined {

@@ -328,22 +328,13 @@ export function createReaders(config) {
       'listunspent',
     ],
   })
-  const l2Rpc = createRpcClient({
-    url: config.l2.url,
-    timeoutMs: config.l2.timeoutMs,
-    label: 'L2',
-    allowedMethods: [
-      'eth_chainId',
-      'eth_blockNumber',
-      'eth_getBalance',
-      'eth_getTransactionCount',
-      'eth_getCode',
-      'web3_clientVersion',
-      'net_version',
-      'net_listening',
-    ],
-  })
-  return { l1: createL1Reader(l1Rpc), l2: createL2Reader(l2Rpc) }
+  return {
+    l1: createL1Reader(l1Rpc),
+    l2: createL2Reader({
+      endpoint: config.l2.url,
+      timeoutMs: config.l2.timeoutMs,
+    }),
+  }
 }
 
 export async function startFromEnv(env = process.env) {

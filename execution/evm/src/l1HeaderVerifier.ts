@@ -438,3 +438,452 @@ export function validateNetworkParams(chain: string, expectedChain: string): voi
     throw new ProtocolError(`Network mismatch: expected ${expectedChain}, got ${chain}`)
   }
 }
+
+/*============================================================================
+  BTCS L1 best-chain selection — independent local chain selection
+============================================================================*/
+
+export type ChainConsensusParams = Readonly<{
+  network: string
+  powLimit: bigint
+  retargetInterval: number
+  targetTimespan: number
+  targetSpacing: number
+  maxRetargetFactor: number
+  maxFutureTime: number
+}>
+
+export const DEFAULT_CHAIN_PARAMS: ChainConsensusParams = Object.freeze({
+  network: 'regtest',
+  powLimit: BigInt(0x7fffff) << BigInt(232),
+  retargetInterval: 2016,
+  targetTimespan: 14 * 24 * 60 * 60,
+  targetSpacing: 600,
+  maxRetargetFactor: 4,
+  maxFutureTime: 2 * 60 * 60,
+})
+
+export type Checkpoint = Readonly<{
+  network: string
+  height: number
+  hash: string
+  bits: string
+  time: number
+  chainwork: bigint
+}>
+
+export type HeaderChainEntry = Readonly<{
+  header: L1Header
+  target: bigint
+  chainwork: bigint
+}>
+
+export type BestChainTip = Readonly<{
+  entry: HeaderChainEntry
+  height: number
+  chainwork: bigint
+}>
+
+export type ChainSelectionResult = Readonly<{
+  tip: HeaderChainEntry | null
+  height: number
+  chainwork: bigint
+  complete: boolean
+  errors: string[]
+}>
+
+export type LocalVerificationModel =
+  | 'local-best-chain+local-inclusion-proof'
+  | 'local-best-chain-only'
+  | 'incomplete'
+
+export function computeChainwork(target: bigint): bigint {
+  if (target < 0n) {
+    throw new ProtocolError('proof-of-work target must be non-negative')
+  }
+  const twoPow256 = BigInt(1) << BigInt(256)
+  return twoPow256 / (target + 1n)
+}
+
+export function encodeCompact(target: bigint): string {
+  if (target <= 0n) {
+    throw new ProtocolError('target must be positive for compact encoding')
+  }
+  const hex = target.toString(16)
+  const padded = hex.length % 2 === 1 ? `0${hex}` : hex
+  const bytes = Buffer.from(padded, 'hex')
+  let start = 0
+  while (start < bytes.length - 1 && bytes[start] === 0) start++
+  const magnitude = bytes.subarray(start)
+  const size = magnitude.length
+
+  if (size <= 3) {
+    const mantissa = Buffer.alloc(3, 0)
+    magnitude.copy(mantissa, 3 - magnitude.length)
+    const bits = (3 << 24) | (mantissa[0] << 16) | (mantissa[1] << 8) | mantissa[2]
+    return bits.toString(16).padStart(8, '0')
+  }
+  const exponent = size
+  const mantissa = Buffer.from([magnitude[0], magnitude[1], magnitude[2]])
+  const bits =
+    (exponent << 24) |
+    (mantissa[0] << 16) |
+    (mantissa[1] << 8) |
+    mantissa[2]
+  return bits.toString(16).padStart(8, '0')
+}
+
+export function computeNextTarget(
+  prevTarget: bigint,
+  prevTime: number,
+  firstTime: number,
+  params: ChainConsensusParams,
+): bigint | null {
+  const actualTimespan = BigInt(prevTime - firstTime)
+  let targetTimespan = BigInt(params.targetTimespan)
+  const lowerBound = targetTimespan / BigInt(params.maxRetargetFactor)
+  const upperBound = targetTimespan * BigInt(params.maxRetargetFactor)
+  let adjustedTimespan = actualTimespan
+  if (adjustedTimespan < lowerBound) adjustedTimespan = lowerBound
+  if (adjustedTimespan > upperBound) adjustedTimespan = upperBound
+  const newTarget = (prevTarget * adjustedTimespan) / targetTimespan
+  if (newTarget > params.powLimit) {
+    return params.powLimit
+  }
+  return newTarget
+}
+
+export function medianTimePast(timestamps: readonly number[]): number | null {
+  if (timestamps.length < 11) {
+    return null
+  }
+  const sorted = [...timestamps].sort((a, b) => a - b)
+  return sorted[Math.floor(sorted.length / 2)]
+}
+
+export function validateCheckpoint(
+  checkpoint: Checkpoint,
+  params: ChainConsensusParams,
+): void {
+  if (!HASH_RE.test(checkpoint.hash)) {
+    throw new ProtocolError('checkpoint hash must be 64 lowercase hex characters')
+  }
+  if (!Number.isSafeInteger(checkpoint.height) || checkpoint.height < 0) {
+    throw new ProtocolError('checkpoint height must be a non-negative safe integer')
+  }
+  if (
+    !Number.isSafeInteger(checkpoint.time) ||
+    checkpoint.time < 0 ||
+    checkpoint.time > 0xffffffff
+  ) {
+    throw new ProtocolError('checkpoint time must be a valid Unix timestamp')
+  }
+  if (typeof checkpoint.bits !== 'string' || !/^[0-9a-f]{8}$/.test(checkpoint.bits)) {
+    throw new ProtocolError('checkpoint has invalid compact difficulty bits')
+  }
+  if (checkpoint.chainwork <= 0n) {
+    throw new ProtocolError('checkpoint chainwork must be positive')
+  }
+  if (checkpoint.network !== params.network) {
+    throw new ProtocolError(
+      `Checkpoint network '${checkpoint.network}' does not match configured network '${params.network}'`,
+    )
+  }
+  const target = compactToTarget(Number.parseInt(checkpoint.bits, 16))
+  if (target > params.powLimit) {
+    throw new ProtocolError('checkpoint target exceeds the proof-of-work limit')
+  }
+}
+
+export class BestChainSelector {
+  private readonly params: ChainConsensusParams
+  private readonly checkpoint: Checkpoint
+  private readonly headersByHash: Map<string, HeaderChainEntry> = new Map()
+  private readonly childrenByHash: Map<string, string[]> = new Map()
+  private bestTip: HeaderChainEntry | null = null
+  private incomplete = false
+
+  constructor(checkpoint: Checkpoint, params: ChainConsensusParams = DEFAULT_CHAIN_PARAMS) {
+    validateCheckpoint(checkpoint, params)
+    this.checkpoint = checkpoint
+    this.params = params
+
+    const checkpointTarget = compactToTarget(Number.parseInt(checkpoint.bits, 16))
+    const checkpointEntry: HeaderChainEntry = {
+      header: {
+        hash: checkpoint.hash,
+        previousblockhash: '0'.repeat(64),
+        merkleroot: '0'.repeat(64),
+        time: checkpoint.time,
+        bits: checkpoint.bits,
+        nonce: 0,
+        height: checkpoint.height,
+      },
+      target: checkpointTarget,
+      chainwork: checkpoint.chainwork,
+    }
+    this.headersByHash.set(checkpoint.hash, checkpointEntry)
+    this.bestTip = checkpointEntry
+  }
+
+  addHeader(header: L1Header): boolean {
+    const hash = header.hash
+    if (!HASH_RE.test(hash)) {
+      throw new ProtocolError('candidate header has an invalid hash')
+    }
+    if (this.headersByHash.has(hash)) {
+      return true
+    }
+
+    const parentHash = header.previousblockhash
+    if (!HASH_RE.test(parentHash)) {
+      throw new ProtocolError('candidate header has an invalid previous block hash')
+    }
+    if (!Number.isSafeInteger(header.height) || header.height < 0) {
+      throw new ProtocolError('candidate header has an invalid height')
+    }
+    if (
+      typeof header.time !== 'number' ||
+      !Number.isSafeInteger(header.time) ||
+      header.time < 0 ||
+      header.time > 0xffffffff
+    ) {
+      throw new ProtocolError('candidate header has an invalid time')
+    }
+    if (
+      typeof header.bits !== 'string' ||
+      !/^[0-9a-f]{8}$/.test(header.bits)
+    ) {
+      throw new ProtocolError('candidate header has invalid compact difficulty bits')
+    }
+
+    if (hash === this.checkpoint.hash) {
+      return true
+    }
+
+    const parentEntry = this.headersByHash.get(parentHash)
+    if (parentEntry === undefined) {
+      throw new ProtocolError(
+        `candidate header ${hash} does not connect to a validated ancestor`,
+      )
+    }
+
+    if (header.height !== parentEntry.header.height + 1) {
+      throw new ProtocolError(
+        `candidate header ${hash} height ${header.height} does not follow parent height ${parentEntry.header.height}`,
+      )
+    }
+
+    let computedHash: string
+    try {
+      computedHash = computeBlockHash(header)
+    } catch (error) {
+      throw new ProtocolError(
+        `candidate header ${hash} failed serialization: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    }
+    if (computedHash !== hash) {
+      throw new ProtocolError(
+        `candidate header ${hash} hash does not match serialized fields`,
+      )
+    }
+
+    const target = compactToTarget(Number.parseInt(header.bits, 16))
+    if (target <= 0n) {
+      throw new ProtocolError('candidate header target is zero or negative')
+    }
+    if (target > this.params.powLimit) {
+      throw new ProtocolError('candidate header target exceeds proof-of-work limit')
+    }
+
+    const numericHash = BigInt(`0x${hash}`)
+    if (numericHash > target) {
+      throw new ProtocolError('candidate header hash does not satisfy its proof-of-work target')
+    }
+
+    let expectedTarget: bigint | null = null
+    const height = header.height
+    const isRetargetPoint = height % this.params.retargetInterval === 0
+
+    if (isRetargetPoint) {
+      const ancestor = this.getAncestorAt(header, height - this.params.retargetInterval)
+      if (ancestor !== null) {
+        const firstOfPeriod = this.getAncestorAt(header, height - this.params.retargetInterval + 1)
+        expectedTarget = computeNextTarget(
+          ancestor.target,
+          ancestor.header.time as number,
+          (firstOfPeriod?.header.time ?? ancestor.header.time) as number,
+          this.params,
+        )
+      } else {
+        this.incomplete = true
+      }
+    } else {
+      expectedTarget = parentEntry.target
+    }
+
+    if (expectedTarget !== null && target !== expectedTarget) {
+      throw new ProtocolError(
+        `candidate header ${hash} nBits ${header.bits} does not match expected difficulty target`,
+      )
+    }
+
+    if (height >= 10) {
+      const timestamps = this.getAncestorTimestamps(header, 11)
+      if (timestamps.length === 11) {
+        const mtp = medianTimePast(timestamps)
+        if (mtp !== null && (header.time as number) <= mtp) {
+          throw new ProtocolError(
+            `candidate header ${hash} time ${header.time} is not greater than median-time-past ${mtp}`,
+          )
+        }
+      } else {
+        this.incomplete = true
+      }
+    }
+
+    const now = Math.floor(Date.now() / 1000)
+    if ((header.time as number) > now + this.params.maxFutureTime) {
+      throw new ProtocolError(
+        `candidate header ${hash} time is more than ${this.params.maxFutureTime} seconds in the future`,
+      )
+    }
+
+    const headerWork = computeChainwork(target)
+    const chainwork = parentEntry.chainwork + headerWork
+
+    const entry: HeaderChainEntry = { header, target, chainwork }
+    this.headersByHash.set(hash, entry)
+
+    const children = this.childrenByHash.get(parentHash) ?? []
+    if (!children.includes(hash)) {
+      children.push(hash)
+      this.childrenByHash.set(parentHash, children)
+    }
+
+    if (this.bestTip === null || chainwork > this.bestTip.chainwork) {
+      this.bestTip = entry
+    } else if (chainwork === this.bestTip.chainwork) {
+      if (hash < this.bestTip.header.hash) {
+        this.bestTip = entry
+      }
+    }
+
+    return true
+  }
+
+  getSelectedTip(): HeaderChainEntry | null {
+    return this.bestTip
+  }
+
+  getChainHeight(): number {
+    return this.bestTip?.header.height ?? this.checkpoint.height
+  }
+
+  getChainwork(): bigint {
+    return this.bestTip?.chainwork ?? this.checkpoint.chainwork
+  }
+
+  isOnSelectedChain(blockHash: string): boolean {
+    if (!HASH_RE.test(blockHash)) {
+      return false
+    }
+    const entry = this.headersByHash.get(blockHash)
+    if (entry === undefined) {
+      return false
+    }
+    return this.isAncestorOfTip(entry)
+  }
+
+  isComplete(): boolean {
+    return !this.incomplete
+  }
+
+  private isAncestorOfTip(entry: HeaderChainEntry): boolean {
+    let current: HeaderChainEntry | null = this.bestTip
+    const visited = new Set<string>()
+    while (current !== null && !visited.has(current.header.hash)) {
+      visited.add(current.header.hash)
+      if (current.header.hash === entry.header.hash) {
+        return true
+      }
+      const parent = this.headersByHash.get(current.header.previousblockhash)
+      current = parent ?? null
+    }
+    return false
+  }
+
+  private getAncestorAt(
+    header: L1Header,
+    targetHeight: number,
+  ): HeaderChainEntry | null {
+    if (targetHeight < this.checkpoint.height) {
+      return null
+    }
+    let current: HeaderChainEntry | undefined = this.headersByHash.get(
+      header.hash,
+    )
+    while (current !== undefined && current.header.height > targetHeight) {
+      current = this.headersByHash.get(current.header.previousblockhash)
+    }
+    return current !== undefined && current.header.height === targetHeight
+      ? current
+      : null
+  }
+
+  private getAncestorTimestamps(
+    header: L1Header,
+    count: number,
+  ): number[] {
+    const timestamps: number[] = []
+    let current: HeaderChainEntry | undefined = this.headersByHash.get(
+      header.hash,
+    )
+    while (current !== undefined && timestamps.length < count) {
+      timestamps.push(current.header.time as number)
+      current = this.headersByHash.get(current.header.previousblockhash)
+    }
+    return timestamps.reverse()
+  }
+}
+
+/**
+ * Create a checkpoint from a validated L1 header.
+ *
+ * @param header - validated checkpoint header
+ * @param chainwork - accumulated chainwork at this checkpoint
+ * @param params - consensus parameters
+ * @returns a Checkpoint object
+ */
+export function createCheckpoint(
+  header: L1Header,
+  chainwork: bigint,
+  params: ChainConsensusParams,
+): Checkpoint {
+  if (chainwork <= 0n) {
+    throw new ProtocolError('checkpoint chainwork must be positive')
+  }
+  if (!HASH_RE.test(header.hash)) {
+    throw new ProtocolError('checkpoint header hash must be 64 lowercase hex characters')
+  }
+  if (typeof header.bits !== 'string' || !/^[0-9a-f]{8}$/.test(header.bits)) {
+    throw new ProtocolError('checkpoint header has invalid compact difficulty bits')
+  }
+  if (typeof header.time !== 'number') {
+    throw new ProtocolError('checkpoint header has an invalid time')
+  }
+  const target = compactToTarget(Number.parseInt(header.bits, 16))
+  if (target > params.powLimit) {
+    throw new ProtocolError('checkpoint target exceeds the proof-of-work limit')
+  }
+  return {
+    network: params.network,
+    height: header.height,
+    hash: header.hash,
+    bits: header.bits,
+    time: header.time,
+    chainwork,
+  }
+}

@@ -1,6 +1,9 @@
 import { ProtocolError } from './blockProcessor.js'
 import type { BtcsL1ConfirmationRpc } from './btcsL1Confirmation.js'
-import { verifyBtcsL1TxOutProof } from './l1HeaderVerifier.js'
+import {
+  verifyBtcsL1TxOutProof,
+  type BestChainSelector,
+} from './l1HeaderVerifier.js'
 
 export const BTCS_L1_DEPOSIT_FORMAT = 'btcs-l2-l1-deposit-intent'
 export const BTCS_L1_DEPOSIT_VERSION = 1
@@ -33,6 +36,8 @@ export type BtcsL1DepositReport = Readonly<{
   verificationModel:
     | 'trusted-btcs-core-rpc'
     | 'trusted-btcs-core-rpc+local-inclusion-proof'
+    | 'local-best-chain+local-inclusion-proof'
+    | 'local-best-chain-only'
   inclusionProofVerified: boolean
   depositId: string
   txid: string
@@ -153,7 +158,11 @@ function valueToSatoshis(value: unknown): string {
 export async function verifyBtcsL1Deposit(
   rpc: BtcsL1DepositRpc,
   request: BtcsL1DepositRequest,
+  options: Readonly<{
+    bestChainSelector?: BestChainSelector
+  }> = {},
 ): Promise<BtcsL1DepositReport> {
+  const { bestChainSelector } = options
   if (
     typeof request.txid !== 'string' ||
     !HASH_RE.test(request.txid) ||
@@ -188,7 +197,7 @@ export async function verifyBtcsL1Deposit(
   if (tx.blockhash !== request.blockHash) {
     throw new ProtocolError('transaction is not in the requested block')
   }
-  if (tx.in_active_chain !== true) {
+  if (bestChainSelector === undefined && tx.in_active_chain !== true) {
     throw new ProtocolError('deposit transaction is not confirmed in the active chain')
   }
   if (!Array.isArray(tx.vout)) {
@@ -262,6 +271,16 @@ export async function verifyBtcsL1Deposit(
     throw new ProtocolError('transaction and block header confirmation counts disagree')
   }
 
+  // When a local best-chain selector is provided, require the block to be a
+  // member of the locally selected chain.
+  if (bestChainSelector !== undefined) {
+    if (!bestChainSelector.isOnSelectedChain(request.blockHash)) {
+      throw new ProtocolError(
+        'block is not a member of the locally selected best chain',
+      )
+    }
+  }
+
   let inclusionProofVerified = false
   if (typeof rpc.getTxOutProof === 'function') {
     const proof = await rpc.getTxOutProof(request.txid, request.blockHash)
@@ -289,9 +308,16 @@ export async function verifyBtcsL1Deposit(
   return {
     format: 'btcs-l2-btcs-l1-deposit-verification',
     version: 1,
-    verificationModel: inclusionProofVerified
-      ? 'trusted-btcs-core-rpc+local-inclusion-proof'
-      : 'trusted-btcs-core-rpc',
+    verificationModel: (() => {
+      if (bestChainSelector !== undefined) {
+        return inclusionProofVerified
+          ? 'local-best-chain+local-inclusion-proof'
+          : 'local-best-chain-only'
+      }
+      return inclusionProofVerified
+        ? 'trusted-btcs-core-rpc+local-inclusion-proof'
+        : 'trusted-btcs-core-rpc'
+    })(),
     inclusionProofVerified,
     depositId: `${request.txid}:${payment.outputIndex}`,
     txid: request.txid,

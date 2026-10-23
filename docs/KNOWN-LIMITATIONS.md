@@ -75,7 +75,8 @@ This document catalogs every known limitation, missing feature, and area where t
 
 | ID | Limitation | Impact | Mitigation |
 |----|------------|--------|------------|
-| LIM-L1-001 | Trusted Core RPC for deposit/anchor confirmation (SG-01) | Local header-hash, PoW, and partial Merkle-proof verification is integrated when the RPC exposes `gettxoutproof`; confirmation and deposit fail closed on malformed/wrong-txid/wrong-block/root mismatch. The header and active-chain view still come from the configured Core RPC. No independent most-work chain selection, P2P consensus, or finality proof; fallback without `gettxoutproof` is trusted-RPC only. A verified partial proof is not canonical membership. | Documented; regtest only; do not call it trustless SPV |
+| LIM-L1-001 | Trusted Core RPC for deposit/anchor confirmation (SG-01) | Local best-chain selection now validates candidate headers (80-byte hash, PoW, parent linkage, height, nBits retarget, median-time-past) anchored at a trusted checkpoint, and selects the tip with greatest cumulative work. Confirmation and deposit use the selected chain when reporting `local-best-chain+local-inclusion-proof` or `local-best-chain-only`. Partial Merkle proof verification is retained when `gettxoutproof` is available. The Core RPC supplies header data but is not chain-selection authority. No independent peer consensus, no chain discovery, no finality proof; single-source candidate withholding remains possible. Fallback without local best-chain verification remains trusted-RPC only. A verified partial proof is not canonical membership. | Documented; regtest only; do not call it trustless SPV |
+| LIM-L1-011 | Single-source candidate header withholding | With one potentially dishonest RPC source, competing branches may be withheld; independent peer consensus and complete chain discovery are not implemented. The local best-chain selector only sees headers supplied by the caller. | Documented; requires multi-source header feed or P2P sync to resolve |
 | LIM-L1-002 | Deposit reorg recovery remains operator-invoked (SG-05) | The watcher now freezes a configured L2 store on permanent invalidation, but a human must run re-derivation/adoption | Durable recovery gate; automatic recovery not implemented |
 | LIM-L1-003 | Source-specific fungible attribution partial (SG-04) | Address-level only, not per-deposit | Conservative freeze |
 | LIM-L1-004 | Deep reorg handling fails closed (SG-11) | No recovery beyond retained history; watcher durably freezes configured L2 store | Operator recovery only |
@@ -135,8 +136,8 @@ This document catalogs every known limitation, missing feature, and area where t
 | **Degrading UX** | 10 |
 | **Missing features (planned)** | 15 |
 | **Security gates (by design)** | 8 |
-| **Architecture gaps (spec vs impl)** | 10 |
-| **Total** | 43 |
+| **Architecture gaps (spec vs impl)** | 11 |
+| **Total** | 44 |
 
 ---
 

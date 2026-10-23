@@ -34,20 +34,38 @@ Not implemented:
 - Node.js 24.17.x
 - A running BTCS L1 Core node with an optional loaded wallet
 - A running BTCS L2 EVM JSON-RPC endpoint
-- No npm dependencies; the service uses Node built-ins and `fetch`
+- The sibling `silver-labs-platform` checkout for the shared BTCS L2 client
+  while its package has no approved remote/release
 
 ## Run
 
 ```bash
+cd ~/Silver-Labs/btcs-l2/services/silverpay-service
+npm ci
 SILVERPAY_L1_RPC_URL=http://127.0.0.1:29444 \
 SILVERPAY_L1_COOKIE_FILE="$HOME/.local/share/<datadir>/regtest/.cookie" \
 SILVERPAY_L2_RPC_URL=http://127.0.0.1:8545 \
-node services/silverpay-service/src/server.mjs
+node src/server.mjs
 ```
 
 The default bind is `127.0.0.1:3002`. Copy `.env.example` as a reference; do not
 commit a real cookie file or credentials. The service reads the cookie at
 startup, so restart it after Core rotates the cookie.
+
+The L2 reader uses the shared read-only
+`@silver-labs/btcs-l2-client` through the lockfile's local
+`file:../../../silver-labs-platform/packages/btcs-l2-client` dependency. This
+workspace link is not a published or portable SDK release. Do not replace it
+with a guessed registry version; consume a reviewed, approved release only
+after the platform remote and release process are authorized.
+
+SilverPay uses the SDK's only registered profile, `BTCS_L2_LOCAL`. The SDK
+checks explicit network identity schema v1, local profile ID
+`btcs-l2-local`, chain ID `31337`, and the `BTCSL2/` client banner before any
+normal read. Unsupported schema versions, profiles, or RPC identity are
+reported as unavailable/invalid upstream responses. The schema check is
+development-only and is not cryptographic authentication or proof of
+consensus.
 
 ## Endpoints
 
@@ -77,7 +95,9 @@ curl -sS http://127.0.0.1:3002/api/silverpay/l2/account/0x0000000000000000000000
 - The service binds to a loopback host only.
 - L1 and L2 URLs must be HTTP(S) and must not contain embedded credentials.
 - L1 Core cookie/user-password authentication supports local Core RPC.
-- RPC methods are allowlisted in `src/server.mjs`; there is no generic proxy.
+- L1 RPC methods are allowlisted in `src/server.mjs`; L2 RPC calls are limited
+  to the shared read-only client's implemented methods. There is no generic
+  proxy.
 - Browser origins must be explicitly allowlisted.
 - No keys, seeds, signing capabilities, or write RPC methods are present.
 - The service itself has no authentication or TLS; do not expose it beyond
@@ -99,7 +119,18 @@ curl -sS http://127.0.0.1:3002/api/silverpay/l2/account/0x0000000000000000000000
 ## Test
 
 ```bash
-node --test services/silverpay-service/tests/*.test.mjs
+cd ~/Silver-Labs/btcs-l2/services/silverpay-service
+npm test
+npm run check
 ```
 
-Run `node --check services/silverpay-service/src/*.mjs` for a syntax check.
+With the local BTCS L2 RPC running, verify the real consumer path with:
+
+```bash
+SILVERPAY_L2_RPC_URL=http://127.0.0.1:8545 npm run test:integration
+```
+
+The integration test requires a loopback BTCS L2 local RPC and performs only
+identity, block, and account reads. Until a release is authorized, another
+product agent must use the documented sibling workspace checkout and run
+`npm ci`; this does not establish a published package dependency.

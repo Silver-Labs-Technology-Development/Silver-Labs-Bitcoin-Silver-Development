@@ -4,6 +4,8 @@ import {
   verifyBtcsL1AnchorConfirmation,
   type BtcsL1ConfirmationRpc,
 } from './btcsL1Confirmation.js'
+import type { BestChainSelector } from './l1HeaderVerifier.js'
+
 import {
   observeBtcsL1Publication,
   reobserveBtcsL1Publication,
@@ -29,6 +31,7 @@ export async function verifyAndAdvanceBtcsL1Publication(
   rpc: BtcsL1ConfirmationRpc,
   record: BtcsL1PublicationRecord,
   blockHash: string,
+  bestChainSelector?: BestChainSelector,
 ): Promise<BtcsL1PublicationRecord> {
   if (
     record.state !== 'submitted' &&
@@ -51,13 +54,15 @@ export async function verifyAndAdvanceBtcsL1Publication(
     blockHash,
     batchHash: record.batchHash,
     requiredConfirmations: 1,
-  })
+  }, { bestChainSelector })
 
   if (
     report.format !== 'btcs-l2-btcs-l1-confirmation' ||
     report.version !== 1 ||
     (report.verificationModel !== 'trusted-btcs-core-rpc' &&
-      report.verificationModel !== 'trusted-btcs-core-rpc+local-inclusion-proof') ||
+      report.verificationModel !== 'trusted-btcs-core-rpc+local-inclusion-proof' &&
+      report.verificationModel !== 'local-best-chain-only' &&
+      report.verificationModel !== 'local-best-chain+local-inclusion-proof') ||
     report.txid !== record.txid ||
     report.blockHash !== blockHash ||
     report.batchHash !== record.batchHash ||
@@ -107,6 +112,7 @@ export async function verifyAndAdvanceBtcsL1PublicationInStore(
   blockHash: string,
   batchValue: unknown,
   checkpoint?: SettlementContinuityCheckpoint,
+  bestChainSelector?: BestChainSelector,
 ): Promise<BtcsL1PublicationRecord> {
   const current = store.get(batchHash)
   if (current === undefined) {
@@ -117,6 +123,7 @@ export async function verifyAndAdvanceBtcsL1PublicationInStore(
     rpc,
     current,
     blockHash,
+    bestChainSelector,
   )
 
   if (
@@ -170,6 +177,7 @@ export async function verifyAndAdvanceBtcsL1PublicationWithContinuity(
   blockHash: string,
   batchValue: unknown,
   checkpoint?: SettlementContinuityCheckpoint,
+  bestChainSelector?: BestChainSelector,
 ): Promise<Readonly<{
   publication: BtcsL1PublicationRecord
   continuityCursor: SettlementContinuityCursor | null
@@ -181,6 +189,7 @@ export async function verifyAndAdvanceBtcsL1PublicationWithContinuity(
     blockHash,
     batchValue,
     checkpoint,
+    bestChainSelector,
   )
   return {
     publication,
