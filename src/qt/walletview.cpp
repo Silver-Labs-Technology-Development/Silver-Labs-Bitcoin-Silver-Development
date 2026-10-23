@@ -10,6 +10,7 @@
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/overviewpage.h>
+#include <qt/silverforgepage.h>
 #include <qt/platformstyle.h>
 #include <qt/receivecoinsdialog.h>
 #include <qt/sendcoinsdialog.h>
@@ -39,6 +40,8 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     // Create tabs
     overviewPage = new OverviewPage(platformStyle);
     overviewPage->setWalletModel(walletModel);
+    silverForgePage = new SilverForgePage(platformStyle, this);
+    silverForgePage->setModel(walletModel);
 
     transactionsPage = new QWidget(this);
     QVBoxLayout *vbox = new QVBoxLayout();
@@ -73,6 +76,7 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     addWidget(transactionsPage);
     addWidget(receiveCoinsPage);
     addWidget(sendCoinsPage);
+    addWidget(silverForgePage);
 
     connect(overviewPage, &OverviewPage::transactionClicked, this, &WalletView::transactionClicked);
     // Clicking on a transaction on the overview pre-selects the transaction on the transaction history page
@@ -151,6 +155,11 @@ void WalletView::gotoOverviewPage()
 void WalletView::gotoHistoryPage()
 {
     setCurrentWidget(transactionsPage);
+}
+
+void WalletView::gotoSilverForgePage()
+{
+    setCurrentWidget(silverForgePage);
 }
 
 void WalletView::gotoReceiveCoinsPage()

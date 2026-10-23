@@ -12,6 +12,7 @@
 
 class ClientModel;
 class OverviewPage;
+class SilverForgePage;
 class PlatformStyle;
 class ReceiveCoinsDialog;
 class SendCoinsDialog;
@@ -59,6 +60,7 @@ private:
     WalletModel* const walletModel;
 
     OverviewPage *overviewPage;
+    SilverForgePage *silverForgePage;
     QWidget *transactionsPage;
     ReceiveCoinsDialog *receiveCoinsPage;
     SendCoinsDialog *sendCoinsPage;
@@ -75,6 +77,8 @@ public Q_SLOTS:
     void gotoOverviewPage();
     /** Switch to history (transactions) page */
     void gotoHistoryPage();
+    /** Switch to the SilverForge development page */
+    void gotoSilverForgePage();
     /** Switch to receive coins page */
     void gotoReceiveCoinsPage();
     /** Switch to send coins page */

@@ -283,6 +283,13 @@ void BitcoinGUI::createActions()
     historyAction->setShortcut(QKeySequence(QStringLiteral("Alt+4")));
     tabGroup->addAction(historyAction);
 
+    silverForgeAction = new QAction(tr("&SilverForge"), this);
+    silverForgeAction->setStatusTip(tr("Open the SilverForge L2 development interface"));
+    silverForgeAction->setToolTip(silverForgeAction->statusTip());
+    silverForgeAction->setCheckable(true);
+    silverForgeAction->setShortcut(QKeySequence(QStringLiteral("Alt+5")));
+    tabGroup->addAction(silverForgeAction);
+
 #ifdef ENABLE_WALLET
     // These showNormalIfMinimized are needed because Send Coins and Receive Coins
     // can be triggered from the tray menu, and need to show the GUI to be useful.
@@ -294,6 +301,8 @@ void BitcoinGUI::createActions()
     connect(receiveCoinsAction, &QAction::triggered, this, &BitcoinGUI::gotoReceiveCoinsPage);
     connect(historyAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
     connect(historyAction, &QAction::triggered, this, &BitcoinGUI::gotoHistoryPage);
+    connect(silverForgeAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
+    connect(silverForgeAction, &QAction::triggered, this, &BitcoinGUI::gotoSilverForgePage);
 #endif // ENABLE_WALLET
 
     quitAction = new QAction(tr("E&xit"), this);
@@ -637,6 +646,7 @@ void BitcoinGUI::createToolBars()
         toolbar->addAction(sendCoinsAction);
         toolbar->addAction(receiveCoinsAction);
         toolbar->addAction(historyAction);
+        toolbar->addAction(silverForgeAction);
         overviewAction->setChecked(true);
 
 #ifdef ENABLE_WALLET
@@ -856,6 +866,7 @@ void BitcoinGUI::setWalletActionsEnabled(bool enabled)
     sendCoinsAction->setEnabled(enabled);
     receiveCoinsAction->setEnabled(enabled);
     historyAction->setEnabled(enabled && !isPrivacyModeActivated());
+    silverForgeAction->setEnabled(enabled);
     encryptWalletAction->setEnabled(enabled);
     backupWalletAction->setEnabled(enabled);
     changePassphraseAction->setEnabled(enabled);
@@ -1015,6 +1026,12 @@ void BitcoinGUI::gotoHistoryPage()
 {
     historyAction->setChecked(true);
     if (walletFrame) walletFrame->gotoHistoryPage();
+}
+
+void BitcoinGUI::gotoSilverForgePage()
+{
+    silverForgeAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoSilverForgePage();
 }
 
 void BitcoinGUI::gotoReceiveCoinsPage()
