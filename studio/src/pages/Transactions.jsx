@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { rpcCall } from '../lib/api'
-import { getRecentTransactions } from '../lib/explorer.js'
+import { getRecentTransactions, lookupExplorerQuery } from '../lib/explorer.js'
 
 function Transactions() {
   const [blocks, setBlocks] = useState([])
@@ -8,6 +8,11 @@ function Transactions() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [latestBlock, setLatestBlock] = useState(null)
+  const [lookupQuery, setLookupQuery] = useState('')
+  const [lookupResult, setLookupResult] = useState(null)
+  const [lookupSubmitted, setLookupSubmitted] = useState(false)
+  const [lookupLoading, setLookupLoading] = useState(false)
+  const [lookupError, setLookupError] = useState(null)
 
   const fetchBlocks = useCallback(async () => {
     setLoading(true)
@@ -61,6 +66,23 @@ function Transactions() {
     return () => clearInterval(interval)
   }, [fetchBlocks])
 
+  const handleLookup = async (event) => {
+    event.preventDefault()
+    setLookupLoading(true)
+    setLookupError(null)
+    setLookupResult(null)
+    setLookupSubmitted(true)
+
+    try {
+      setLookupResult(await lookupExplorerQuery(lookupQuery, rpcCall))
+    } catch (err) {
+      console.error('Failed to look up L2 block or transaction:', err)
+      setLookupError(err.message)
+    } finally {
+      setLookupLoading(false)
+    }
+  }
+
   const formatAddress = (addr) => {
     if (!addr) return 'N/A'
     return `${addr.slice(0, 6)}...${addr.slice(-4)}`
@@ -98,6 +120,91 @@ function Transactions() {
           Failed to fetch data: {error}. Make sure the L2 node is running on http://127.0.0.1:8545
         </div>
       )}
+
+      <section className="card" aria-labelledby="explorer-lookup-title">
+        <h2 id="explorer-lookup-title" className="card-header">Look up an L2 block or transaction</h2>
+        <form onSubmit={handleLookup}>
+          <label className="label" htmlFor="explorer-lookup">
+            Block number, block hash, or transaction hash
+          </label>
+          <div className="explorer-lookup-controls">
+            <input
+              id="explorer-lookup"
+              className="input explorer-lookup-input"
+              value={lookupQuery}
+              onChange={(event) => setLookupQuery(event.target.value)}
+              placeholder="e.g. 42 or 0x..."
+              autoComplete="off"
+              spellCheck="false"
+            />
+            <button className="btn" type="submit" disabled={lookupLoading || !lookupQuery.trim()}>
+              {lookupLoading ? 'Searching...' : 'Search'}
+            </button>
+          </div>
+        </form>
+        {lookupError && (
+          <p className="warning explorer-lookup-message" role="alert">{lookupError}</p>
+        )}
+        {lookupSubmitted && !lookupLoading && !lookupError && !lookupResult && (
+          <p className="explorer-lookup-message" role="status">No matching L2 block or transaction was found.</p>
+        )}
+        {lookupResult?.type === 'block' && (
+          <div className="explorer-lookup-result" role="status">
+            <h3>Block {lookupResult.block.number}</h3>
+            <dl className="explorer-result-grid">
+              <div><dt>Hash</dt><dd title={lookupResult.block.hash}>{lookupResult.block.hash}</dd></div>
+              <div><dt>Timestamp</dt><dd>{formatTime(lookupResult.block.timestamp)}</dd></div>
+              <div><dt>Transactions</dt><dd>{lookupResult.block.txCount}</dd></div>
+              <div><dt>Gas used / limit</dt><dd>{lookupResult.block.gasUsed.toLocaleString()} / {lookupResult.block.gasLimit.toLocaleString()}</dd></div>
+            </dl>
+            <h4>Transactions in this block</h4>
+            {lookupResult.transactions.length === 0
+              ? <p>This block contains no transactions.</p>
+              : (
+                <ul className="explorer-lookup-transactions">
+                  {lookupResult.transactions.map((transaction) => (
+                    <li key={transaction.hash}>
+                      <span title={transaction.hash}>{formatHash(transaction.hash)}</span>
+                      <span>
+                        {transaction.receiptStatus === '0x1'
+                          ? 'Success'
+                          : transaction.receiptStatus === '0x0'
+                            ? 'Reverted'
+                            : 'Receipt unavailable'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            {lookupResult.block.txCount > lookupResult.transactions.length && (
+              <p className="explorer-lookup-note">
+                Showing {lookupResult.transactions.length} of {lookupResult.block.txCount} transactions.
+              </p>
+            )}
+          </div>
+        )}
+        {lookupResult?.type === 'transaction' && (
+          <div className="explorer-lookup-result" role="status">
+            <h3>Transaction</h3>
+            <dl className="explorer-result-grid">
+              <div><dt>Hash</dt><dd title={lookupResult.transaction.hash}>{lookupResult.transaction.hash}</dd></div>
+              <div><dt>Block</dt><dd>{lookupResult.transaction.blockNumber === null
+                ? 'Pending / not included'
+                : Number.parseInt(lookupResult.transaction.blockNumber, 16)}</dd></div>
+              <div><dt>From</dt><dd>{lookupResult.transaction.from}</dd></div>
+              <div><dt>To</dt><dd>{lookupResult.transaction.to || 'Contract creation'}</dd></div>
+              <div><dt>Receipt gas used</dt><dd>{lookupResult.transaction.receiptGasUsed === null
+                ? 'Unavailable'
+                : Number.parseInt(lookupResult.transaction.receiptGasUsed, 16).toLocaleString()}</dd></div>
+              <div><dt>Status</dt><dd>{lookupResult.transaction.receiptStatus === '0x1'
+                ? 'Success'
+                : lookupResult.transaction.receiptStatus === '0x0'
+                  ? 'Reverted'
+                  : 'Receipt unavailable'}</dd></div>
+            </dl>
+          </div>
+        )}
+      </section>
 
       <div className="card">
         <div className="card-header">Recent L2 Blocks</div>

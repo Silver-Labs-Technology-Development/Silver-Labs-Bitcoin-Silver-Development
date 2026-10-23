@@ -17,6 +17,7 @@ BTCS L2 is an experimental EVM-compatible Layer 2 prototype for Bitcoin Silver (
 - Withdrawal lifecycle management (request → authorize → payout → confirm)
 - Operator-controlled, chain-guarded payout adapter (disabled by default)
 - SilverPay read-only loopback service for separate L1 UTXO/balance and L2 account/network reads
+- Studio's bounded local L2 transaction view, with recent blocks and RPC lookup by block number/hash or transaction hash; this is not a reorg-aware explorer or L1 indexer
 
 ## Quick Start (Developer Node)
 
