@@ -26,6 +26,9 @@ function Transactions() {
           rpcCall('eth_getBlockByNumber', ['0x' + blockNum.toString(16), true])
             .then(block => {
               if (!block) return null
+              if (!Array.isArray(block.transactions)) {
+                throw new Error(`Block ${block.number} omitted its full transaction list`)
+              }
               return {
                 number: parseInt(block.number, 16),
                 hash: block.hash,
