@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { rpcCall } from '../lib/api'
+import { getRecentTransactions } from '../lib/explorer.js'
 
 function Transactions() {
   const [blocks, setBlocks] = useState([])
@@ -29,10 +30,11 @@ function Transactions() {
                 number: parseInt(block.number, 16),
                 hash: block.hash,
                 timestamp: parseInt(block.timestamp, 16),
-                txCount: block.transactions?.length || 0,
+                txCount: block.transactions.length,
                 gasUsed: parseInt(block.gasUsed, 16),
                 gasLimit: parseInt(block.gasLimit, 16),
                 miner: block.miner,
+                transactions: block.transactions,
               }
             })
         )
@@ -41,14 +43,7 @@ function Transactions() {
       setBlocks(fetchedBlocks)
 
       // Collect all transactions from these blocks
-      const allTxs = fetchedBlocks.flatMap(block =>
-        (block.transactions || []).map(tx => ({
-          ...tx,
-          blockNumber: block.number,
-          blockHash: block.hash,
-        }))
-      )
-      setTransactions(allTxs.slice(0, 50))
+      setTransactions(await getRecentTransactions(fetchedBlocks, rpcCall))
     } catch (err) {
       console.error('Failed to fetch blocks:', err)
       setError(err.message)
@@ -81,6 +76,9 @@ function Transactions() {
   return (
     <div className="container">
       <h1 style={{ color: 'var(--btcs-gold)', marginBottom: '2rem' }}>Transactions & Blocks</h1>
+      <p style={{ color: 'var(--text-secondary)', marginTop: '-1.5rem', marginBottom: '1.5rem' }}>
+        Local BTCS L2 only · recent 10 blocks · no L1 explorer or address history
+      </p>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
@@ -178,13 +176,25 @@ function Transactions() {
                         ? `${(BigInt(tx.value) / 1000000000000000000n).toString()} BTCS`
                         : '0'}
                     </td>
-                    <td>{tx.gasUsed ? parseInt(tx.gasUsed, 16).toLocaleString() : 'N/A'}</td>
+                    <td>
+                      {tx.receiptGasUsed !== null
+                        ? parseInt(tx.receiptGasUsed, 16).toLocaleString()
+                        : 'N/A'}
+                    </td>
                     <td>
                       <span style={{
-                        color: tx.status === '0x1' ? 'var(--success)' : 'var(--error)',
+                        color: tx.receiptStatus === '0x1'
+                          ? 'var(--success)'
+                          : tx.receiptStatus === '0x0'
+                            ? 'var(--error)'
+                            : 'var(--text-secondary)',
                         fontWeight: 600,
                       }}>
-                        {tx.status === '0x1' ? 'Success' : 'Reverted'}
+                        {tx.receiptStatus === '0x1'
+                          ? 'Success'
+                          : tx.receiptStatus === '0x0'
+                            ? 'Reverted'
+                            : 'Receipt unavailable'}
                       </span>
                     </td>
                   </tr>
