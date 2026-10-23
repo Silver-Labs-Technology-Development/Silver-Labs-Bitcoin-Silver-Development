@@ -60,6 +60,24 @@ test('v1 batch builds and verifies an ordered genesis-plus-child sequence', asyn
   })
 })
 
+test('genesis batch rejects a non-zero previous commitment', async () => {
+  await withStore(async (directory) => {
+    const processor = await PersistentBlockProcessor.open(directory)
+    const view = await processor.createCanonicalReadView()
+    const genesis = view.getCanonicalBlockByNumber(0n)
+    assert.ok(genesis)
+    const envelope = createEvmSettlementEnvelope(
+      genesis.blockRlpHex,
+      '1'.repeat(64),
+    )
+
+    assert.throws(
+      () => createEvmSettlementBatch([envelope]),
+      /genesis batch must use the zero previous commitment/,
+    )
+  })
+})
+
 test('v1 batch rejects incorrect starting anchors', async () => {
   await withStore(async (directory) => {
     const { batch } = await makeTwoBlockBatch(directory)

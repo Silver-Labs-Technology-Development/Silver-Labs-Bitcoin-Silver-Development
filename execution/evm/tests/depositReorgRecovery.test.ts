@@ -9,6 +9,7 @@ import {
   GENESIS_TIMESTAMP,
   PersistentBlockProcessor,
   ProtocolError,
+  createStaticDepositBackingProvider,
   type PersistentBlockProcessorOptions,
 } from '../src/blockProcessor.js'
 import {
@@ -68,6 +69,29 @@ function recordFor(
   }
 }
 
+function defaultDepositBacking() {
+  return createStaticDepositBackingProvider([
+    recordFor(),
+    recordFor({
+      depositId: `${'d'.repeat(64)}:1`,
+      txid: 'd'.repeat(64),
+      depositOutputIndex: 1,
+      recipientAddress: secondRecipient.toString(),
+      blockHash: 'e'.repeat(64),
+    }),
+  ])
+}
+
+async function openTestChain(
+  directory: string,
+  options: PersistentBlockProcessorOptions = {},
+): Promise<PersistentBlockProcessor> {
+  return PersistentBlockProcessor.open(directory, {
+    depositBackingProvider: defaultDepositBacking(),
+    ...options,
+  })
+}
+
 function senderTx(nonce: bigint, to: Address, value: bigint) {
   return createFeeMarket1559Tx({
     chainId: EVM_CHAIN_ID,
@@ -103,7 +127,7 @@ async function fixture(
   const root = await mkdtemp(join(tmpdir(), 'btcs-l2-deposit-recovery-'))
   try {
     const sourceDirectory = join(root, 'source')
-    const chain = await PersistentBlockProcessor.open(sourceDirectory, processorOptions)
+    const chain = await openTestChain(sourceDirectory, processorOptions)
     await body({ root, sourceDirectory, chain })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -137,7 +161,7 @@ async function chainWithExtensibleChild(
   await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [operation])
   const block1 = await chain.getCanonicalBlockByNumber(1n)
   assert.ok(block1)
-  const mirror = await PersistentBlockProcessor.open(join(root, 'mirror'))
+  const mirror = await openTestChain(join(root, 'mirror'))
   await mirror.acceptBlock(
     hexToBytes(block1.blockRlpHex as `0x${string}`),
     [operation],
@@ -194,7 +218,7 @@ test('re-derivation removes an unspent invalidated credit and its balance', asyn
     assert.notEqual(report.reDerivedTip.hash, sourceTip.hash)
     assert.equal(report.sourceTip.hash, sourceTip.hash)
 
-    const rederived = await PersistentBlockProcessor.open(report.outputDirectory)
+    const rederived = await openTestChain(report.outputDirectory)
     const rederivedView = await rederived.createCanonicalReadView()
     assert.equal(await rederivedView.getAccountBalance(recipient), 0n)
     assert.equal(rederivedView.getCanonicalDepositOperations(1n).length, 0)
@@ -225,7 +249,7 @@ test('independent post-credit transactions survive re-derivation unchanged', asy
       outputDirectory: join(root, 'out'),
     })
 
-    const rederived = await PersistentBlockProcessor.open(report.outputDirectory)
+    const rederived = await openTestChain(report.outputDirectory)
     const rederivedView = await rederived.createCanonicalReadView()
     // The surviving independent transaction is preserved with its effects.
     assert.equal(await rederivedView.getAccountBalance(otherAccount), 5n)
@@ -323,7 +347,7 @@ test('successful recovery adopts the re-derived tip and reopens the canonical st
 
     const continuation = await chain.buildNextBlock([], GENESIS_TIMESTAMP + 2n)
     assert.equal(continuation.summary.number, '2')
-    const reopened = await PersistentBlockProcessor.open(sourceDirectory)
+    const reopened = await openTestChain(sourceDirectory)
     assert.equal(reopened.tip.hash, continuation.summary.hash)
   })
 })
@@ -347,7 +371,7 @@ test('adoption commits canonical metadata last and remains safely retryable on f
     )
 
     assert.deepEqual(chain.tip, originalTip)
-    assert.equal((await PersistentBlockProcessor.open(sourceDirectory)).tip.hash, originalTip.hash)
+    assert.equal((await openTestChain(sourceDirectory)).tip.hash, originalTip.hash)
     assert.equal((await readDepositRecoveryGate(sourceDirectory))?.status, 'frozen')
 
     const adoptedTip = await chain.adoptReDerivedStore(outputDirectory)
@@ -378,7 +402,7 @@ test('re-including a reorged-out deposit credits it exactly once', async () => {
       invalidatedDepositIds: [operation.depositId],
       outputDirectory: join(root, 'out'),
     })
-    const rederived = await PersistentBlockProcessor.open(report.outputDirectory)
+    const rederived = await openTestChain(report.outputDirectory)
 
     // The deposit becomes canonical again on L1: re-credit it on the re-derived chain.
     await rederived.buildNextBlock([], GENESIS_TIMESTAMP + 100n, [operation])
@@ -411,7 +435,7 @@ test('re-derivation of one deposit in a multi-deposit block keeps the others', a
     assert.equal(report.blocksRebuilt, 1)
     assert.deepEqual(report.droppedDepositIds, [first.depositId])
 
-    const rederived = await PersistentBlockProcessor.open(report.outputDirectory)
+    const rederived = await openTestChain(report.outputDirectory)
     const rederivedView = await rederived.createCanonicalReadView()
     assert.equal(await rederivedView.getAccountBalance(recipient), 0n)
     assert.equal(await rederivedView.getAccountBalance(secondRecipient), amountWei)
@@ -483,7 +507,7 @@ test('an existing output directory is rejected before any work', async () => {
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [operation])
     const view = await chain.createCanonicalReadView()
     const outputDirectory = join(root, 'out')
-    await PersistentBlockProcessor.open(outputDirectory)
+    await openTestChain(outputDirectory)
 
     await assert.rejects(
       rederiveCanonicalL2AfterDepositInvalidation({
@@ -517,7 +541,7 @@ test('a failed recovery freeze persists across a processor reopen', async () => 
       DepositReorgRecoveryError,
     )
 
-    const reopened = await PersistentBlockProcessor.open(sourceDirectory)
+    const reopened = await openTestChain(sourceDirectory)
     await assert.rejects(
       reopened.buildNextBlock([], GENESIS_TIMESTAMP + 2n),
       DepositRecoveryGateError,
@@ -645,7 +669,7 @@ test('isolated replay into a fresh store still works while recovery has frozen t
     )
     assert.equal((await readDepositRecoveryGate(sourceDirectory))?.status, 'frozen')
 
-    const fresh = await PersistentBlockProcessor.open(join(root, 'fresh'))
+    const fresh = await openTestChain(join(root, 'fresh'))
     await fresh.acceptBlock(
       hexToBytes(block1.blockRlpHex as `0x${string}`),
       [operation],
@@ -668,7 +692,7 @@ test('adoption refuses a candidate that still credits a deposit involved in the 
     const block1 = await chain.getCanonicalBlockByNumber(1n)
     assert.ok(block1)
     const candidateDirectory = join(root, 'candidate')
-    const candidate = await PersistentBlockProcessor.open(candidateDirectory)
+    const candidate = await openTestChain(candidateDirectory)
     await candidate.acceptBlock(
       hexToBytes(block1.blockRlpHex as `0x${string}`),
       [operation],

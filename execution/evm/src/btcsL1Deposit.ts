@@ -1,5 +1,6 @@
 import { ProtocolError } from './blockProcessor.js'
 import type { BtcsL1ConfirmationRpc } from './btcsL1Confirmation.js'
+import { verifyBtcsL1TxOutProof } from './l1HeaderVerifier.js'
 
 export const BTCS_L1_DEPOSIT_FORMAT = 'btcs-l2-l1-deposit-intent'
 export const BTCS_L1_DEPOSIT_VERSION = 1
@@ -29,7 +30,10 @@ export type BtcsL1DepositRequest = Readonly<{
 export type BtcsL1DepositReport = Readonly<{
   format: 'btcs-l2-btcs-l1-deposit-verification'
   version: 1
-  verificationModel: 'trusted-btcs-core-rpc'
+  verificationModel:
+    | 'trusted-btcs-core-rpc'
+    | 'trusted-btcs-core-rpc+local-inclusion-proof'
+  inclusionProofVerified: boolean
   depositId: string
   txid: string
   blockHash: string
@@ -44,7 +48,7 @@ export type BtcsL1DepositReport = Readonly<{
 
 export type BtcsL1DepositRpc = Pick<
   BtcsL1ConfirmationRpc,
-  'getRawTransaction' | 'getBlockHeader'
+  'getRawTransaction' | 'getBlockHeader' | 'getTxOutProof'
 >
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -258,11 +262,37 @@ export async function verifyBtcsL1Deposit(
     throw new ProtocolError('transaction and block header confirmation counts disagree')
   }
 
+  let inclusionProofVerified = false
+  if (typeof rpc.getTxOutProof === 'function') {
+    const proof = await rpc.getTxOutProof(request.txid, request.blockHash)
+    const proofReport = verifyBtcsL1TxOutProof(
+      proof,
+      request.blockHash,
+      request.txid,
+    )
+    if (
+      typeof header.merkleroot === 'string' &&
+      header.merkleroot !== proofReport.merkleRoot
+    ) {
+      throw new ProtocolError('block header merkle root does not match the inclusion proof')
+    }
+    if (
+      typeof header.previousblockhash === 'string' &&
+      header.previousblockhash !== proofReport.previousBlockHash
+    ) {
+      throw new ProtocolError('block header previous hash does not match the inclusion proof')
+    }
+    inclusionProofVerified = true
+  }
+
   const payment = paymentOutputs[0]
   return {
     format: 'btcs-l2-btcs-l1-deposit-verification',
     version: 1,
-    verificationModel: 'trusted-btcs-core-rpc',
+    verificationModel: inclusionProofVerified
+      ? 'trusted-btcs-core-rpc+local-inclusion-proof'
+      : 'trusted-btcs-core-rpc',
+    inclusionProofVerified,
     depositId: `${request.txid}:${payment.outputIndex}`,
     txid: request.txid,
     blockHash: request.blockHash,

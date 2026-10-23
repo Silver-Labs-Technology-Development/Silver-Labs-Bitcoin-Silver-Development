@@ -189,6 +189,22 @@ export function calculateDepositAccounting(input: Readonly<{
   let securedSats = 0n
   for (const record of input.secured) {
     if (record.state !== 'confirmed') continue
+    const existing = confirmed.get(record.depositId)
+    if (existing !== undefined) {
+      if (
+        existing.blockHash !== record.blockHash ||
+        existing.amountSats !== record.amountSats ||
+        existing.recipientAddress.toLowerCase() !==
+          record.recipientAddress.toLowerCase() ||
+        existing.txid !== record.txid ||
+        existing.depositOutputIndex !== record.depositOutputIndex
+      ) {
+        throw new ProtocolError(
+          'confirmed deposit backing contains conflicting duplicate records',
+        )
+      }
+      continue
+    }
     confirmed.set(record.depositId, record)
     securedSats += BigInt(record.amountSats)
   }
@@ -279,6 +295,12 @@ export function classifyDepositReorg(input: Readonly<{
   if (typeof depositId !== 'string' || !DEPOSIT_ID_RE.test(depositId)) {
     throw new ProtocolError('deposit ID must be a transaction ID and output index')
   }
+  if (l1 !== undefined && l1.depositId !== depositId) {
+    throw new ProtocolError('L1 deposit record does not match the classified deposit ID')
+  }
+  if (credit !== undefined && credit.depositId !== depositId) {
+    throw new ProtocolError('L2 deposit credit does not match the classified deposit ID')
+  }
   const validatedCredit = credit === undefined ? undefined : commit([credit])[0]!
   const base = {
     format: DEPOSIT_REORG_PLAN_FORMAT,
@@ -307,12 +329,38 @@ export function classifyDepositReorg(input: Readonly<{
   }
 
   if (l1?.state === 'confirmed' && l1.blockHash === validatedCredit.sourceBlockHash) {
+    const sameRecipient =
+      l1.recipientAddress.toLowerCase() ===
+      validatedCredit.recipientAddress.toLowerCase()
+    const sameAmount =
+      BigInt(l1.amountSats) * SATOSHI_TO_WEI === BigInt(validatedCredit.amountWei)
+    if (sameRecipient && sameAmount) {
+      return {
+        ...base,
+        timing: 're-inclusion',
+        action: 'no-op',
+        progressBlocked: false,
+        reason: 'L1 deposit is confirmed again on the same inclusion as the L2 credit',
+      }
+    }
+    if (input.creditSpent) {
+      return {
+        ...base,
+        timing: 're-inclusion',
+        action: 'freeze-bridge',
+        progressBlocked: true,
+        reason:
+          'L2 credit does not match the confirmed L1 recipient or amount after post-credit outflow',
+      }
+    }
     return {
       ...base,
       timing: 're-inclusion',
-      action: 'no-op',
-      progressBlocked: false,
-      reason: 'L1 deposit is confirmed again on the same inclusion as the L2 credit',
+      action: 'revert-l2-credit',
+      progressBlocked: true,
+      rederiveFromBlock: validatedCredit.creditedAtBlock,
+      reason:
+        'L2 credit does not match the confirmed L1 recipient or amount; revert it before re-crediting',
     }
   }
 

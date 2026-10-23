@@ -111,13 +111,22 @@ async function withFixture(
   body: (context: {
     store: BtcsL1DepositStore
     chain: PersistentBlockProcessor
+    addBacking: (record: BtcsL1DepositRecord) => void
   }) => Promise<void>,
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'btcs-l2-deposit-accounting-'))
   try {
     const store = await BtcsL1DepositStore.create(join(root, 'deposits'))
-    const chain = await PersistentBlockProcessor.open(join(root, 'chain'))
-    await body({ store, chain })
+    const extraBacking = new Map<string, BtcsL1DepositRecord>()
+    const chain = await PersistentBlockProcessor.open(join(root, 'chain'), {
+      depositBackingProvider: {
+        get: (depositId) => store.get(depositId) ?? extraBacking.get(depositId),
+      },
+    })
+    const addBacking = (record: BtcsL1DepositRecord) => {
+      extraBacking.set(record.depositId, record)
+    }
+    await body({ store, chain, addBacking })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -129,9 +138,9 @@ function makeRecord(
   return {
     format: BTCS_L1_DEPOSIT_RECORD_FORMAT,
     version: BTCS_L1_DEPOSIT_RECORD_VERSION,
-    depositId: `${'a'.repeat(64)}:0`,
+    depositId: `${'a'.repeat(64)}:1`,
     txid: 'a'.repeat(64),
-    depositOutputIndex: 0,
+    depositOutputIndex: 1,
     recipientAddress: `0x${'1'.repeat(40)}`,
     amountSats,
     requiredConfirmations: 6,
@@ -168,6 +177,30 @@ test('accounting holds when every L2 credit is backed by a confirmed L1 deposit'
   assert.equal(report.creditedWei, (BigInt(amountSats) * SATOSHI_TO_WEI).toString(10))
   assert.equal(report.securedWei, report.creditedWei)
   assert.equal(report.unbackedCreditedWei, '0')
+})
+
+test('duplicate secured copies do not inflate L1 backing', () => {
+  const record = makeRecord()
+  const credit = creditForRecord(record)
+  const report = calculateDepositAccounting({
+    secured: [record, { ...record }],
+    credits: [credit],
+  })
+  assert.equal(report.status, 'ok')
+  assert.equal(report.securedWei, (BigInt(amountSats) * SATOSHI_TO_WEI).toString(10))
+  assert.equal(report.backedCreditCount, 1)
+})
+
+test('conflicting duplicate secured records are rejected', () => {
+  const record = makeRecord()
+  assert.throws(
+    () =>
+      calculateDepositAccounting({
+        secured: [record, { ...record, amountSats: '1' }],
+        credits: [],
+      }),
+    /conflicting duplicate/,
+  )
 })
 
 test('an L2 credit whose L1 inclusion was invalidated is reported unbacked', () => {
@@ -271,6 +304,38 @@ test('classify: same inclusion confirmed again is a no-op', () => {
   assert.equal(plan.timing, 're-inclusion')
   assert.equal(plan.action, 'no-op')
   assert.equal(plan.progressBlocked, false)
+})
+
+test('classify: same inclusion with a wrong recipient is not a no-op', () => {
+  const record = makeRecord()
+  const credit = creditForRecord(record, {
+    recipientAddress: `0x${'2'.repeat(40)}`,
+  })
+  const plan = classifyDepositReorg({
+    depositId,
+    l1: record,
+    credit,
+    creditSpent: false,
+  })
+  assert.equal(plan.action, 'revert-l2-credit')
+  assert.equal(plan.progressBlocked, true)
+  assert.match(plan.reason, /recipient or amount/)
+})
+
+test('classify: same inclusion with a wrong amount freezes after a spend', () => {
+  const record = makeRecord()
+  const credit = creditForRecord(record, {
+    amountWei: (BigInt(amountSats) * 2n * SATOSHI_TO_WEI).toString(10),
+  })
+  const plan = classifyDepositReorg({
+    depositId,
+    l1: record,
+    credit,
+    creditSpent: true,
+  })
+  assert.equal(plan.action, 'freeze-bridge')
+  assert.equal(plan.progressBlocked, true)
+  assert.match(plan.reason, /recipient or amount/)
 })
 
 test('classify: a confirmed deposit with no credit is credited once', () => {
@@ -407,7 +472,7 @@ test('transaction fees count as outflow even when the transaction transfers no v
 })
 
 test('post-credit outflow is detected even when later funding keeps balance above the credit', async () => {
-  await withFixture(async ({ store, chain }) => {
+  await withFixture(async ({ store, chain, addBacking }) => {
     const firstRecord = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
     const firstOperation = createEvmDepositOperation(firstRecord)
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [firstOperation])
@@ -418,12 +483,14 @@ test('post-credit outflow is detected even when later funding keeps balance abov
     const laterRecord = makeRecord({
       depositId: `${'d'.repeat(64)}:0`,
       txid: 'd'.repeat(64),
+      depositOutputIndex: 0,
       recipientAddress: recipient.toString().toLowerCase(),
       amountSats: (BigInt(amountSats) / 2n).toString(10),
       blockHash: 'e'.repeat(64),
       blockHeight: 201,
       confirmations: 8,
     })
+    addBacking(laterRecord)
     const laterOperation = createEvmDepositOperation(laterRecord)
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 3n, [laterOperation])
 
@@ -485,7 +552,7 @@ test('incomplete spend traces freeze an unbacked credit instead of assuming it w
 })
 
 test('canonical execution tracing observes a value transfer from a credited contract', async () => {
-  await withFixture(async ({ store, chain }) => {
+  await withFixture(async ({ store, chain, addBacking }) => {
     const deployerRecord = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
     const deployerOperation = createEvmDepositOperation(deployerRecord)
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [deployerOperation])
@@ -529,12 +596,14 @@ test('canonical execution tracing observes a value transfer from a credited cont
     const contractRecord = makeRecord({
       depositId: `${'f'.repeat(64)}:0`,
       txid: 'f'.repeat(64),
+      depositOutputIndex: 0,
       recipientAddress: contractAddress.toString().toLowerCase(),
       amountSats: '100',
       blockHash: 'e'.repeat(64),
       blockHeight: 202,
       confirmations: 8,
     })
+    addBacking(contractRecord)
     const contractOperation = createEvmDepositOperation(contractRecord)
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 3n, [contractOperation])
 
@@ -566,7 +635,7 @@ test('canonical execution tracing observes a value transfer from a credited cont
 })
 
 test('canonical execution tracing observes a credited contract selfdestruct', async () => {
-  await withFixture(async ({ store, chain }) => {
+  await withFixture(async ({ store, chain, addBacking }) => {
     const deployerRecord = await verifyAndRecordBtcsL1Deposit(makeRpc(), store, request())
     const deployerOperation = createEvmDepositOperation(deployerRecord)
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [deployerOperation])
@@ -599,12 +668,14 @@ test('canonical execution tracing observes a credited contract selfdestruct', as
     const contractRecord = makeRecord({
       depositId: `${'8'.repeat(64)}:0`,
       txid: '8'.repeat(64),
+      depositOutputIndex: 0,
       recipientAddress: contractAddress.toString().toLowerCase(),
       amountSats: '100',
       blockHash: '9'.repeat(64),
       blockHeight: 203,
       confirmations: 8,
     })
+    addBacking(contractRecord)
     const contractOperation = createEvmDepositOperation(contractRecord)
     await chain.buildNextBlock([], GENESIS_TIMESTAMP + 3n, [contractOperation])
 

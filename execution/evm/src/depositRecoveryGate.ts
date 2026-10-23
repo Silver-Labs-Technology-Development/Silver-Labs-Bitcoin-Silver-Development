@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { open, readFile, rename, rm } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 /**
@@ -130,7 +130,7 @@ export async function readDepositRecoveryGate(
   return parseGate(JSON.parse(raw.toString('utf8')) as unknown)
 }
 
-/** Persist the gate marker atomically (write-temp then rename). */
+/** Persist the gate marker atomically and durably (fsync file and directory). */
 export async function writeDepositRecoveryGate(
   directory: string,
   state: DepositRecoveryGateState,
@@ -138,19 +138,46 @@ export async function writeDepositRecoveryGate(
   const validated = parseGate(state)
   const target = gatePath(directory)
   const temporary = resolve(directory, `.${randomUUID()}.deposit-gate.tmp`)
-  const encoded = `${JSON.stringify(validated)}\n`
-  await writeFile(temporary, encoded, { encoding: 'utf8', flag: 'wx' })
+  const encoded = Buffer.from(`${JSON.stringify(validated)}\n`, 'utf8')
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  let renamed = false
   try {
+    handle = await open(temporary, 'wx', 0o600)
+    await handle.writeFile(encoded)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
     await rename(temporary, target)
+    renamed = true
+
+    const directoryHandle = await open(directory, 'r')
+    try {
+      await directoryHandle.sync()
+    } finally {
+      await directoryHandle.close()
+    }
   } catch (error) {
-    await rm(temporary, { force: true })
+    if (handle !== undefined) await handle.close().catch(() => undefined)
+    if (!renamed) await rm(temporary, { force: true }).catch(() => undefined)
     throw error
   }
 }
 
-/** Remove the gate marker, reopening the store to block production. */
+/** Remove the gate marker durably, reopening the store to block production. */
 export async function clearDepositRecoveryGate(directory: string): Promise<void> {
-  await rm(gatePath(directory), { force: true })
+  try {
+    await rm(gatePath(directory))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return
+  }
+  const directoryHandle = await open(directory, 'r')
+  try {
+    await directoryHandle.sync()
+  } finally {
+    await directoryHandle.close()
+  }
 }
 
 /**

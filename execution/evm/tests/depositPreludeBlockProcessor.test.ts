@@ -7,6 +7,7 @@ import { Address, unprefixedHexToBytes } from '@ethereumjs/util'
 import {
   GENESIS_TIMESTAMP,
   PersistentBlockProcessor,
+  createStaticDepositBackingProvider,
 } from '../src/blockProcessor.js'
 import {
   createEvmDepositOperation,
@@ -39,12 +40,15 @@ function makeRecord(
 
 async function withTemporaryChain(
   body: (root: string, chainDirectory: string, chain: PersistentBlockProcessor) => Promise<void>,
+  depositBacking = createStaticDepositBackingProvider([makeRecord()]),
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'btcs-l2-deposit-prelude-'))
   const chainDirectory = join(root, 'chain')
 
   try {
-    const chain = await PersistentBlockProcessor.open(chainDirectory)
+    const chain = await PersistentBlockProcessor.open(chainDirectory, {
+      depositBackingProvider: depositBacking,
+    })
     await body(root, chainDirectory, chain)
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -98,6 +102,39 @@ test('the same deposit output cannot be credited in a later block', async () => 
     const replay = await chain.replay()
     assert.equal(replay.blocks.length, 2)
   })
+})
+
+test('deposit operations are rejected when no L1 backing provider is configured', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'btcs-l2-deposit-prelude-'))
+  try {
+    const chain = await PersistentBlockProcessor.open(join(root, 'chain'))
+    const operation = createEvmDepositOperation(makeRecord())
+    const originalTip = chain.tip
+
+    await assert.rejects(
+      chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [operation]),
+      /require a confirmed L1 deposit backing provider/,
+    )
+    assert.deepEqual(chain.tip, originalTip)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('deposit operations must match the confirmed L1 backing record exactly', async () => {
+  await withTemporaryChain(
+    async (_root, _chainDirectory, chain) => {
+      const operation = createEvmDepositOperation(makeRecord({ amountSats: '1' }))
+      const originalTip = chain.tip
+
+      await assert.rejects(
+        chain.buildNextBlock([], GENESIS_TIMESTAMP + 1n, [operation]),
+        /does not match its confirmed L1 backing record/,
+      )
+      assert.deepEqual(chain.tip, originalTip)
+    },
+    createStaticDepositBackingProvider([makeRecord({ amountSats: '2' })]),
+  )
 })
 
 test('replay rejects a deposit sidecar that differs from the header commitment', async () => {

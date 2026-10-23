@@ -65,6 +65,15 @@ export class BtcsL1CoreRpcClient implements BtcsL1ConfirmationRpc {
     return this.call('getrawtransaction', [txid, true, blockHash])
   }
 
+  /**
+   * Fetch a Bitcoin-style partial Merkle proof. The caller must verify the
+   * returned bytes locally with `verifyBtcsL1TxOutProof`; the RPC result is not
+   * trusted as proof on its own.
+   */
+  async getTxOutProof(txid: string, blockHash: string): Promise<unknown> {
+    return this.call('gettxoutproof', [[txid], blockHash])
+  }
+
   async getBlockHeader(blockHash: string): Promise<unknown> {
     return this.call('getblockheader', [blockHash, true])
   }

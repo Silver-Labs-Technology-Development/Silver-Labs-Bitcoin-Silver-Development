@@ -271,7 +271,7 @@ export async function inspectBtcsL1BatchDataAvailability(options: Readonly<{
   let reconstructedBytes: number | undefined
   let fragmentCount: number | undefined
   if (missingTxids.length === 0 && anchor !== undefined) {
-    const reconstructed = reconstructEvmSettlementBatchFromScripts(
+    const reconstructed = await reconstructEvmSettlementBatchFromScripts(
       options.fragmentTxids.map((txid) => fragmentScripts.get(txid)!),
       options.batchHash,
       options.anchors,

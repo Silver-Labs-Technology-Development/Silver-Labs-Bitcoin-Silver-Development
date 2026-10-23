@@ -24,7 +24,9 @@ test('uses the expected read-only Core RPC methods and parameters', async (t) =>
     })
     const body = calls.length === 1
       ? { txid, blockhash: blockHash }
-      : { hash: blockHash, height: 10, confirmations: 6 }
+      : calls.length === 2
+        ? { hash: blockHash, height: 10, confirmations: 6 }
+        : '00ff'
     return response({ result: body, error: null, id: calls.length })
   }) as typeof fetch
 
@@ -35,6 +37,7 @@ test('uses the expected read-only Core RPC methods and parameters', async (t) =>
   assert.deepEqual(await client.getBlockHeader(blockHash), {
     hash: blockHash, height: 10, confirmations: 6,
   })
+  assert.equal(await client.getTxOutProof(txid, blockHash), '00ff')
 
   assert.deepEqual(calls.map((call) => ({
     url: call.url,
@@ -52,6 +55,12 @@ test('uses the expected read-only Core RPC methods and parameters', async (t) =>
       url: 'http://127.0.0.1:8332/',
       method: 'getblockheader',
       params: [blockHash, true],
+      jsonrpc: '1.0',
+    },
+    {
+      url: 'http://127.0.0.1:8332/',
+      method: 'gettxoutproof',
+      params: [[txid], blockHash],
       jsonrpc: '1.0',
     },
   ])

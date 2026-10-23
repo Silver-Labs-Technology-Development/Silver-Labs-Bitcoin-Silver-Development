@@ -316,7 +316,7 @@ export async function runClientDemo(options: ClientDemoOptions = {}): Promise<Cl
           'A genesis-starting settlement batch is built from canonical block RLP and verified by verifyEvmSettlementBatchExecution; the emitted batch file is accepted by npm run verify:batch:execution.',
         ],
         doesNotProve: [
-          'eth_call and eth_estimateGas are not provided; use deployment + reads or full transactions.',
+          'This demo does not call eth_call or eth_estimateGas. The server implements both; this run does not exercise them.',
           'Blocks are mined only by explicit btcs_dev_mine; there is no automatic mining.',
           'No withdrawal path, escrow, production balance semantics, or L1 acceptance is present.',
           'This is not a production sequencer, RPC server, rollup, proof system, or BTCS settlement client.',

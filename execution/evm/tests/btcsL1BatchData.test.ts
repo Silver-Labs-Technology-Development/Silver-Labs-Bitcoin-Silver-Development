@@ -3,7 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { createBlockFromRLP } from '@ethereumjs/block'
+import { bytesToHex, hexToBytes } from '@ethereumjs/util'
 import { ProtocolError, PersistentBlockProcessor } from '../src/blockProcessor.js'
+import { createHarnessCommon } from '../src/config.js'
 import { encodeBtcsL1AnchorScript } from '../src/btcsL1Anchor.js'
 import {
   BTCS_L1_BATCH_DATA_CHUNK_BYTES,
@@ -46,7 +49,7 @@ async function makeBatch(directory: string) {
 test('encodes canonical settlement bytes into bounded, standard-size OP_RETURN fragments', async () => {
   await withDirectory(async (directory) => {
     const batch = await makeBatch(directory)
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
 
     assert.equal(encoded.batchHash, batch.batchHash)
     assert.ok(encoded.serializedBatch.byteLength <= MAX_BTCS_L1_BATCH_DATA_BYTES)
@@ -67,10 +70,51 @@ test('encodes canonical settlement bytes into bounded, standard-size OP_RETURN f
   })
 })
 
+test('refuses to encode a structurally valid batch whose state root is not executable', async () => {
+  await withDirectory(async (directory) => {
+    const processor = await PersistentBlockProcessor.open(join(directory, 'chain'))
+    const view0 = await processor.createCanonicalReadView()
+    const genesis = view0.getCanonicalBlockByNumber(0n)
+    assert.ok(genesis)
+    const genesisEnvelope = createEvmSettlementEnvelope(genesis.blockRlpHex)
+
+    await processor.buildNextBlock([], 1_750_000_001n)
+    const view1 = await processor.createCanonicalReadView()
+    const child = view1.getCanonicalBlockByNumber(1n)
+    assert.ok(child)
+
+    const block = createBlockFromRLP(
+      hexToBytes(child.blockRlpHex as `0x${string}`),
+      { common: createHarnessCommon() },
+    )
+    block.header.stateRoot.set(hexToBytes(`0x${'1'.repeat(64)}`))
+    const bogusEnvelope = createEvmSettlementEnvelope(
+      bytesToHex(block.serialize()),
+      genesisEnvelope.commitmentHash,
+    )
+    const batch = createEvmSettlementBatch([genesisEnvelope, bogusEnvelope])
+
+    await assert.rejects(
+      () => encodeBtcsL1BatchData(batch, ANCHORS),
+      /state root|execution|replay|mismatch/i,
+    )
+  })
+})
+
+test('rejects an unknown execution-verification mode instead of defaulting to genesis', async () => {
+  await withDirectory(async (directory) => {
+    const batch = await makeBatch(directory)
+    await assert.rejects(
+      () => encodeBtcsL1BatchData(batch, ANCHORS, { kind: 'bogus' } as never),
+      /unsupported batch execution verification mode/,
+    )
+  })
+})
+
 test('reconstructs out-of-order fragments from Core blocks and verifies the existing batch hash', async () => {
   await withDirectory(async (directory) => {
     const batch = await makeBatch(directory)
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     const fragmentTransactions = [...encoded.fragments].reverse().map((fragment) => ({
       vout: [{ scriptPubKey: { hex: fragment.scriptPubKeyHex } }],
     }))
@@ -84,7 +128,7 @@ test('reconstructs out-of-order fragments from Core blocks and verifies the exis
 
     const scripts = extractBtcsL1BatchDataScriptsFromCoreBlocks(blocks)
     assert.equal(scripts.length, encoded.fragments.length + 1)
-    const reconstructed = reconstructEvmSettlementBatchFromCoreBlocks(
+    const reconstructed = await reconstructEvmSettlementBatchFromCoreBlocks(
       blocks,
       batch.batchHash,
       ANCHORS,
@@ -99,14 +143,14 @@ test('reconstructs out-of-order fragments from Core blocks and verifies the exis
 test('rejects missing and duplicate fragments instead of returning partial batch data', async () => {
   await withDirectory(async (directory) => {
     const batch = await makeBatch(directory)
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     const scripts = encoded.fragments.map((fragment) => fragment.scriptPubKeyHex)
 
-    assert.throws(
+    await assert.rejects(
       () => reconstructEvmSettlementBatchFromScripts(scripts.slice(1), batch.batchHash, ANCHORS),
       /incomplete|missing a fragment/,
     )
-    assert.throws(
+    await assert.rejects(
       () => reconstructEvmSettlementBatchFromScripts(
         [...scripts, scripts[0]!],
         batch.batchHash,
@@ -120,17 +164,17 @@ test('rejects missing and duplicate fragments instead of returning partial batch
 test('rejects altered fragment bytes, inconsistent anchors, and a different expected commitment', async () => {
   await withDirectory(async (directory) => {
     const batch = await makeBatch(directory)
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     const scripts = encoded.fragments.map((fragment) => fragment.scriptPubKeyHex)
     const changed = [...scripts]
     const lastScript = changed.at(-1)!
     changed[changed.length - 1] = lastScript.slice(0, -1) + (lastScript.endsWith('0') ? '1' : '0')
 
-    assert.throws(
+    await assert.rejects(
       () => reconstructEvmSettlementBatchFromScripts(changed, batch.batchHash, ANCHORS),
       ProtocolError,
     )
-    assert.throws(
+    await assert.rejects(
       () => reconstructEvmSettlementBatchFromScripts(
         scripts,
         batch.batchHash,
@@ -138,7 +182,7 @@ test('rejects altered fragment bytes, inconsistent anchors, and a different expe
       ),
       /starting height|batch start height/,
     )
-    assert.throws(
+    await assert.rejects(
       () => reconstructEvmSettlementBatchFromScripts(scripts, 'f'.repeat(64), ANCHORS),
       /no matching confirmed/,
     )
@@ -148,7 +192,7 @@ test('rejects altered fragment bytes, inconsistent anchors, and a different expe
 test('ignores unrelated OP_RETURN payloads but rejects malformed fragments using its marker', async () => {
   await withDirectory(async (directory) => {
     const batch = await makeBatch(directory)
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     assert.equal(decodeBtcsL1BatchDataScript(encodeBtcsL1AnchorScript(batch.batchHash)), undefined)
 
     const first = encoded.fragments[0]!

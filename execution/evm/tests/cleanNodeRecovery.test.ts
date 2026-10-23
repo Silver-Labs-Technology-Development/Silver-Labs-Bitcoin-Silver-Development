@@ -36,12 +36,12 @@ test('clean-node recovery: reconstruct batch from L1-published fragments only', 
     const batch = createEvmSettlementBatch([envelope0, envelope1])
     
     // Publish to "L1" as fragments
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     const anchorScript = encodeBtcsL1AnchorScript(batch.batchHash)
     const fragmentScripts = encoded.fragments.map(f => f.scriptPubKeyHex)
     
     // Clean node recovery: only has L1 data, no sequencer DB
-    const recovered = reconstructEvmSettlementBatchFromScripts(
+    const recovered = await reconstructEvmSettlementBatchFromScripts(
       [anchorScript, ...fragmentScripts], // include anchor too
       batch.batchHash,
       ANCHORS
@@ -70,12 +70,12 @@ test('clean-node recovery: fails without complete fragments', async () => {
     assert.ok(child)
     const envelope1 = createEvmSettlementEnvelope((child as any).blockRlpHex ?? (child as any).block?.blockRlpHex, envelope0.commitmentHash)
     const batch = createEvmSettlementBatch([envelope0, envelope1])
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     
     // Missing fragment
     const scripts = encoded.fragments.slice(0, -1).map(f => f.scriptPubKeyHex)
-    assert.throws(() => {
-      reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
+    await assert.rejects(async () => {
+      await reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
     }, /incomplete|missing/)
   } finally {
     await rm(sequencerDir, { recursive: true, force: true })
@@ -97,12 +97,12 @@ test('clean-node recovery: rejects tampered fragment', async () => {
     assert.ok(child)
     const envelope1 = createEvmSettlementEnvelope((child as any).blockRlpHex ?? (child as any).block?.blockRlpHex, envelope0.commitmentHash)
     const batch = createEvmSettlementBatch([envelope0, envelope1])
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     
     // Tamper with fragment
     const scripts = encoded.fragments.map((f, i) => i === 0 ? f.scriptPubKeyHex.replace(/[0-9a-f]$/i, 'b') : f.scriptPubKeyHex)
     try {
-      reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
+      await reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
       assert.fail('should have thrown')
     } catch (e) {
       assert.ok(e instanceof Error)

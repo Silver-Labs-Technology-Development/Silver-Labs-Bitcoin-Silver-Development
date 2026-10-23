@@ -115,8 +115,14 @@ curl -sS http://127.0.0.1:8545/ \
 
 Implemented methods are `web3_clientVersion`, `eth_chainId`,
 `eth_blockNumber`, `eth_getBlockByNumber`, `eth_getBlockByHash`,
-`eth_getTransactionReceipt`, `eth_getCode`, `eth_getStorageAt`,
-`eth_getBalance`, `eth_getTransactionCount`, and `eth_getLogs`. The RPC reads
+`eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_call`,
+`eth_estimateGas`, `eth_getCode`, `eth_getStorageAt`,
+`eth_getBalance`, `eth_getTransactionCount`, `eth_getLogs`,
+`net_version`, `net_listening`, and `net_peerCount`. `eth_call` and
+`eth_estimateGas` run through `runTx` on a discarded state copy.
+`eth_getTransactionByHash` returns null when the hash is unknown.
+`net_listening` is false and `net_peerCount` is `0x0` because this
+process does not run a peer listener. The RPC reads
 only canonical history and replays it from genesis once per HTTP request that
 needs chain data. Requests in one JSON-RPC batch share that validated
 in-memory view; separate requests and store reopens always replay again. The
@@ -138,8 +144,9 @@ the background. The pool accepts up to 1,024 transactions, 15 MiB of serialized
 pending bytes, 64 transactions per sender, and 128 KiB per transaction. Pending
 transactions exist only in process memory and are lost on restart. No key is
 stored and nothing is broadcast. Without `--dev-sequencer`, both methods return
-method-not-found. `eth_call`, full Ethereum JSON-RPC compatibility,
-authentication, remote access, and production availability are not provided.
+method-not-found. Full Ethereum JSON-RPC compatibility, `eth_gasPrice`,
+fee history, native-currency metadata, authentication, remote access, and
+production availability are not provided.
 
 <a id="one-command-client-demo"></a>
 
@@ -180,7 +187,9 @@ contract deploys and mutates state; signed transactions, receipts, logs, code,
 storage, and a transferred balance are visible through the RPC; a reverted
 transaction keeps status `0` with rolled-back storage and logs while its nonce
 and gas effects remain; and the independent settlement replay accepts the
-emitted batch file. What it does not prove: `eth_call`/`eth_estimateGas`,
+emitted batch file. What it does not prove: that this demo itself calls
+`eth_call` or `eth_estimateGas` (those methods exist on the server and are
+covered by `tests/rpcExecution.test.ts` and `tests/rpcWalletReadiness.test.ts`),
 automatic mining, withdrawals or production balance semantics, remote RPC, any
 L1 publication, settlement, or finality, or any production sequencer, rollup,
 proof system, or BTCS settlement client.
@@ -197,10 +206,26 @@ the anchor through trusted Core RPC, and checks that the confirmed publication
 record survives store reopen. The script does not start or stop Core.
 
 Defaults are port `29443`, wallet `btcs-l2-anchor-regtest`, data directory
-`~/.local/share/btcs-l2-regtest-core`, and publication store
-`~/.local/share/btcs-l2-regtest-publications`. Override them with
+`~/.local/share/btcs-l2-regtest-core`, publication store
+`~/.local/share/btcs-l2-regtest-publications`, and continuity store
+`~/.local/share/btcs-l2-regtest-continuity`. Override them with
 `BTCS_L2_REGTEST_PORT`, `BTCS_L2_REGTEST_WALLET`,
-`BTCS_L2_REGTEST_DATADIR`, and `BTCS_L2_PUBLICATION_STORE_DIR`.
+`BTCS_L2_REGTEST_DATADIR`, `BTCS_L2_PUBLICATION_STORE_DIR`, and
+`BTCS_L2_CONTINUITY_STORE_DIR`.
+
+A fresh isolated continuity directory is required for a new genesis-style run.
+The script fails closed if the continuity store already contains a different
+history. A publication store created before the durable continuity binding was
+introduced must be bound explicitly, once, to its intended continuity store:
+
+```bash
+npm run bind:publication-continuity -- \
+  ~/.local/share/btcs-l2-regtest-publications \
+  ~/.local/share/btcs-l2-regtest-continuity
+```
+
+The migration refuses to rebind an already-bound store and never rewrites
+publication records.
 The data directory and daemon must already exist; Core must report
 `chain=regtest`, and the configured wallet must be loaded and funded enough to
 pay a regtest fee. The script uses the data directory's
@@ -287,6 +312,29 @@ noncanonical bytes, incorrect trusted anchors, and a batch hash mismatch. It is
 not an SPV proof, does not itself track reorgs, and does not establish data
 availability by itself; call the active-chain availability inspector to
 recompute status after each reorg or restart.
+
+<a id="settlement-continuity"></a>
+
+## Settlement continuity (`settlementContinuity`)
+
+`SettlementContinuityStore` is a durable single-writer cursor for accepted
+settlement batches. It requires each batch to start exactly one block after the
+cursor, to name the cursor's terminal commitment as its previous commitment, and
+to parent the cursor's last block. Every advancing batch is independently
+re-executed; non-genesis batches require a checkpoint at exactly the cursor
+height. Gaps, overlaps, stale/duplicate history, forks, missing checkpoints, and
+corrupt state fail closed. Writes use a temp-file rename plus file and directory
+fsync, and re-accepting the current batch is idempotent.
+
+`BtcsL1PublicationStore.create/open` require one continuity store and persist a
+durable `continuity-binding.json` sidecar. Reopening with a different continuity
+store, or opening a legacy store without a binding, fails closed. Confirmation
+goes through `observe`/`reobserve`, which require the exact batch value, replay
+it through the bound continuity store, and commit the continuity cursor before
+persisting `confirmed`. Direct methods cannot persist a confirmed record without
+continuity. A failed publication write after the continuity commit can leave the
+cursor one batch ahead until the same batch is retried; this residual is
+documented in SG-13. The store does not prove BTCS L1 publication or finality.
 
 <a id="regtest-deposit-settlement-e2e"></a>
 
@@ -393,6 +441,9 @@ cursor retains up to 10,000 blocks (288 by default); a deeper reorg stops with a
 typed error and requires operator investigation. The watcher persists only
 deposits that meet the configured confirmation count. It returns discovered,
 re-observed, and invalidated deposit IDs but never credits or changes L2 state.
+When `chainDirectory` is configured, a reorg deeper than retained history or a
+confirmed deposit invalidation that is not re-included durably writes the L2
+recovery gate; re-derivation and adoption remain operator-invoked.
 
 Create a cursor once with `BtcsL1DepositWatcher.create`, then use
 `BtcsL1DepositWatcher.open` on later starts. Supply an opened
@@ -518,6 +569,12 @@ automatic invocation of the watcher and recovery on a schedule, and multi-host
 coordination. See
 `docs/DEPOSIT-REORG-RECOVERY-v0.1.md`.
 
+## Native gas denomination
+
+The canonical processor charges gas in the L2 native balance. That balance is the same unit credited by an L1 deposit: `SATOSHI_TO_WEI` in `src/depositPrelude.ts` is `10^10`, so 1 BTCS (`10^8` satoshis) is `10^18` wei. A token transfer does not pay this charge. The block coinbase is required to be the zero address, so the EIP-1559 priority fee is credited there and the base fee is not credited to the sender, the recipient, or the called contract.
+
+`tests/btcsGasAccounting.test.ts` checks four facts on `PersistentBlockProcessor`: the satoshi conversion; an exact native-transfer debit of `value + gasUsed * effectiveGasPrice` that survives reopen; a successful call and a reverted call that debit only the sender; and an underfunded transfer that is rejected with balances and nonce unchanged. Chain id `31337` is the local harness id and collides with common Ethereum dev chains. It is not a registered public BTCS L2 id. The zero-address fee recipient is prototype accounting, not a treasury policy.
+
 ## Fixed execution assumptions
 
 - Genesis allocates `10,000` native units (18 decimals) to one deterministic, test-only private key (`0x11` repeated 32 bytes). This key is public test data and must never hold real assets.
@@ -531,6 +588,18 @@ coordination. See
 - The tests compare the complete per-transaction summaries, receipts/logs, gas, and roots in a fresh replay. That establishes repeatability for these pinned local vectors, not deterministic consensus execution across independent implementations or arbitrary contract inputs.
 
 The repository has no root license file, and the sample Solidity contract is marked `UNLICENSED`. The project's license and permission to redistribute that source are unresolved. EthereumJS package licensing and distribution implications must also be reviewed before publishing or distributing the harness.
+
+## Shared asset engine
+
+`src/assetEngine/` is a client of JSON-RPC networks. It does not change the BTCS L2 chain id, the EIP-1559 fee defaults, or the canonical block processor. `contracts/EvmFungibleAsset.sol` is a fixed-supply fungible template with ERC-20 selectors. BNB profiles label that same interface `bep-20`. A deployment record is `{network id}:{contract address}`. The same bytecode on two networks is two assets. `refuseCrossChainLink()` throws, and no bridge, lock, or remote mint is implemented.
+
+Profiles store a chain id, a native gas symbol, a fee rule, an explorer template, and the name of an environment variable. They do not store an RPC URL or a private key. `BTCS` gas on the local network uses the existing type-2 signer defaults and `btcs_dev_mine`. `ETH` and `tBNB` / `BNB` quotes follow the connected block: EIP-1559 when `baseFeePerGas` is present, otherwise legacy `eth_gasPrice`. Mainnet profiles refuse to send until `allowMainnet` is passed. The local development profile also requires `web3_clientVersion` to start with `BTCSL2/`, because chain id `31337` is shared with other development chains.
+
+```sh
+npm run acceptance:bnb-testnet
+```
+
+That command exits `2` until `BNB_TESTNET_RPC_URL` and `BNB_TESTNET_PRIVATE_KEY` are set to an account with test tBNB. It then deploys the template, transfers one atomic unit, and reads the recipient balance back. A skipped automated test is not a BNB Smart Chain deployment. `tests/assetEngine.test.ts` covers the local BTCS RPC path and the BNB adapter against a mock that does not execute contracts.
 
 ## Direct dependency licenses
 

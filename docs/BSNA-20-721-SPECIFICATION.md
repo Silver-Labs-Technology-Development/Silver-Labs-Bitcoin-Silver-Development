@@ -1,6 +1,6 @@
 # BSNA-20 and BSNA-721 Specification Proposal v1.0 (Draft)
 
-Status: **PROPOSED** - Not implemented  
+Status: **DRAFT PROFILE** — reference contracts exist (`contracts/token/BSNA20.sol`, `contracts/token/BSNA721.sol`) and the asset-service metadata integration tests pass. This is not a product release, and it is not BSNA-FTS1. See `docs/BSNA-FTS1-PROPOSAL.md`.
 Date: 2026-10-22  
 Branch: experimental/deposit-prelude-v1
 

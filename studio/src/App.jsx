@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import Nodes from './pages/Nodes'
 import TokenStudio from './pages/TokenStudio'
 import Transactions from './pages/Transactions'
+import SilverPayWallet from './pages/SilverPayWallet'
 
 function App() {
   return (
@@ -15,6 +16,7 @@ function App() {
           <NavLink to="/nodes" className="nav-link">Nodes</NavLink>
           <NavLink to="/tokens" className="nav-link">Token Studio</NavLink>
           <NavLink to="/transactions" className="nav-link">Transactions</NavLink>
+          <NavLink to="/silverpay" className="nav-link">SilverPay Wallet</NavLink>
         </div>
         <div style={{ color: 'var(--warning)', fontSize: '0.875rem' }}>⚠ EXPERIMENTAL - Trusted Single-Operator</div>
       </nav>
@@ -23,6 +25,7 @@ function App() {
         <Route path="/nodes" element={<Nodes />} />
         <Route path="/tokens" element={<TokenStudio />} />
         <Route path="/transactions" element={<Transactions />} />
+        <Route path="/silverpay" element={<SilverPayWallet />} />
       </Routes>
     </div>
   )

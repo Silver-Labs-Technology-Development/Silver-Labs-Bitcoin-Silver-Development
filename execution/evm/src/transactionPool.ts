@@ -235,6 +235,11 @@ export class DevelopmentSequencer {
     })
   }
 
+  /** Return a pending signed transaction, or undefined when the hash is not queued. */
+  async findPendingTransaction(transactionHash: string): Promise<PendingTransaction['tx'] | undefined> {
+    return this.exclusive(async () => this.byHash.get(transactionHash)?.tx)
+  }
+
   async produceBlock(): Promise<DevelopmentBlockResult> {
     return this.exclusive(async () => {
       const beforeView = await this.chain.createCanonicalReadView()

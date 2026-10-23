@@ -10,6 +10,7 @@ import { Address, hexToBytes, unprefixedHexToBytes } from '@ethereumjs/util'
 import {
   GENESIS_TIMESTAMP,
   PersistentBlockProcessor,
+  createStaticDepositBackingProvider,
 } from '../src/blockProcessor.js'
 import {
   encodeBtcsL1DepositPayload,
@@ -527,7 +528,10 @@ async function main(): Promise<void> {
     )
 
     const chainDirectory = join(scratchDirectory, 'source-chain')
-    const source = await PersistentBlockProcessor.open(chainDirectory)
+    const depositBackingProvider = createStaticDepositBackingProvider([persistedRecord])
+    const source = await PersistentBlockProcessor.open(chainDirectory, {
+      depositBackingProvider,
+    })
 
     const genesis = await source.getCanonicalBlockByNumber(0n)
     assert.ok(genesis, 'fresh source chain must have its fixed genesis')
@@ -623,7 +627,9 @@ async function main(): Promise<void> {
       scratchDirectory,
       'explicit-independent-replay',
     )
-    const independent = await PersistentBlockProcessor.open(independentDirectory)
+    const independent = await PersistentBlockProcessor.open(independentDirectory, {
+      depositBackingProvider,
+    })
 
     const independentGenesis = await independent.getCanonicalBlockByNumber(0n)
     assert.ok(independentGenesis)

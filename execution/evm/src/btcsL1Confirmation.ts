@@ -1,9 +1,17 @@
 import { ProtocolError } from './blockProcessor.js'
 import { BTCS_L1_ANCHOR_MAGIC_HEX, decodeBtcsL1AnchorScript, encodeBtcsL1AnchorScript } from './btcsL1Anchor.js'
+import { verifyBtcsL1TxOutProof } from './l1HeaderVerifier.js'
 
 export type BtcsL1ConfirmationRpc = Readonly<{
   getRawTransaction(txid: string, blockHash: string): Promise<unknown>
   getBlockHeader(blockHash: string): Promise<unknown>
+  /**
+   * Optional local-proof source. When present, a valid partial Merkle proof is
+   * required and verified locally; the trusted-RPC boolean is never accepted as
+   * proof on its own. This still does not establish canonical/most-work chain
+   * membership (SG-01 residual).
+   */
+  getTxOutProof?(txid: string, blockHash: string): Promise<unknown>
 }>
 
 export type BtcsL1ConfirmationRequest = Readonly<{
@@ -16,7 +24,10 @@ export type BtcsL1ConfirmationRequest = Readonly<{
 export type BtcsL1ConfirmationReport = Readonly<{
   format: 'btcs-l2-btcs-l1-confirmation'
   version: 1
-  verificationModel: 'trusted-btcs-core-rpc'
+  verificationModel:
+    | 'trusted-btcs-core-rpc'
+    | 'trusted-btcs-core-rpc+local-inclusion-proof'
+  inclusionProofVerified: boolean
   txid: string
   blockHash: string
   blockHeight: number
@@ -129,10 +140,39 @@ export async function verifyBtcsL1AnchorConfirmation(
     throw new ProtocolError('transaction and block header confirmation counts disagree')
   }
 
+  // When the RPC exposes gettxoutproof, require and verify a partial Merkle
+  // proof locally. This catches a lying inclusion boolean or a proof for a
+  // different transaction/block, but it does not make the header canonical.
+  let inclusionProofVerified = false
+  if (typeof rpc.getTxOutProof === 'function') {
+    const proof = await rpc.getTxOutProof(request.txid, request.blockHash)
+    const proofReport = verifyBtcsL1TxOutProof(
+      proof,
+      request.blockHash,
+      request.txid,
+    )
+    if (
+      typeof header.merkleroot === 'string' &&
+      header.merkleroot !== proofReport.merkleRoot
+    ) {
+      throw new ProtocolError('block header merkle root does not match the inclusion proof')
+    }
+    if (
+      typeof header.previousblockhash === 'string' &&
+      header.previousblockhash !== proofReport.previousBlockHash
+    ) {
+      throw new ProtocolError('block header previous hash does not match the inclusion proof')
+    }
+    inclusionProofVerified = true
+  }
+
   return {
     format: 'btcs-l2-btcs-l1-confirmation',
     version: 1,
-    verificationModel: 'trusted-btcs-core-rpc',
+    verificationModel: inclusionProofVerified
+      ? 'trusted-btcs-core-rpc+local-inclusion-proof'
+      : 'trusted-btcs-core-rpc',
+    inclusionProofVerified,
     txid: request.txid,
     blockHash: request.blockHash,
     blockHeight: header.height as number,

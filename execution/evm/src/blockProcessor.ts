@@ -18,6 +18,9 @@ import {
   equalsBytes,
   hexToBytes,
   unprefixedHexToBytes,
+  type BatchDBOp,
+  type DB,
+  type EncodingOpts,
 } from '@ethereumjs/util'
 import { getActivePrecompiles } from '@ethereumjs/evm'
 import type { EVMResult, EVMMockBlockchainInterface, Message } from '@ethereumjs/evm'
@@ -135,7 +138,101 @@ export type PersistentBlockProcessorOptions = Readonly<{
   persistenceTestHook?: (stage: PersistenceStage) => void | Promise<void>
   /** Maximum wait for another process using the same chain directory. */
   chainDirectoryLockTimeoutMs?: number
+  /**
+   * Read-only source of confirmed L1 deposit records. Deposit credits are
+   * refused unless every operation matches one of these records exactly.
+   * Leave this unset for chains that never credit deposits.
+   */
+  depositBackingProvider?: DepositBackingProvider
 }>
+
+/** The subset of a confirmed L1 deposit record needed to authorize an L2 credit. */
+export type ConfirmedDepositBacking = Readonly<{
+  depositId: string
+  txid: string
+  depositOutputIndex: number
+  recipientAddress: string
+  amountSats: string
+  state: 'confirmed' | 'invalidated'
+  blockHash?: string
+  blockHeight?: number
+}>
+
+export type DepositBackingProvider = Readonly<{
+  get(depositId: string): ConfirmedDepositBacking | undefined
+}>
+
+/** Build a read-only backing provider from already verified L1 records. */
+export function createStaticDepositBackingProvider(
+  records: readonly ConfirmedDepositBacking[],
+): DepositBackingProvider {
+  const byId = new Map<string, ConfirmedDepositBacking>()
+  for (const record of records) {
+    if (byId.has(record.depositId)) {
+      throw new ProtocolError(`duplicate deposit backing record ${record.depositId}`)
+    }
+    byId.set(record.depositId, record)
+  }
+  return { get: (depositId) => byId.get(depositId) }
+}
+
+/**
+ * Explicit provider for isolated settlement replay. The supplied operations
+ * are already committed by an independently verified settlement batch; this
+ * helper does not claim that they are backed by a live L1 deposit store.
+ */
+export function createIsolatedReplayDepositBackingProvider(
+  operations: readonly EvmDepositOperation[],
+): DepositBackingProvider {
+  return createStaticDepositBackingProvider(operations.map((operation) => ({
+    depositId: operation.depositId,
+    txid: operation.txid,
+    depositOutputIndex: operation.outputIndex,
+    recipientAddress: operation.recipientAddress,
+    amountSats: operation.amountSats,
+    state: 'confirmed',
+    blockHash: operation.sourceBlockHash,
+    blockHeight: Number(operation.sourceBlockHeight),
+  })))
+}
+
+function assertDepositOperationsBacked(
+  operations: readonly EvmDepositOperation[],
+  provider: DepositBackingProvider | undefined,
+): void {
+  if (operations.length === 0) return
+  if (provider === undefined) {
+    throw new ProtocolError(
+      'deposit operations require a confirmed L1 deposit backing provider',
+    )
+  }
+
+  for (const operation of operations) {
+    const record = provider.get(operation.depositId)
+    if (record === undefined) {
+      throw new ProtocolError(
+        `deposit ${operation.depositId} has no confirmed L1 backing record`,
+      )
+    }
+    if (record.state !== 'confirmed') {
+      throw new ProtocolError(
+        `deposit ${operation.depositId} is not confirmed on L1`,
+      )
+    }
+    if (
+      record.txid !== operation.txid ||
+      record.depositOutputIndex !== operation.outputIndex ||
+      record.blockHash !== operation.sourceBlockHash ||
+      String(record.blockHeight) !== operation.sourceBlockHeight ||
+      record.recipientAddress !== operation.recipientAddress ||
+      record.amountSats !== operation.amountSats
+    ) {
+      throw new ProtocolError(
+        `deposit ${operation.depositId} does not match its confirmed L1 backing record`,
+      )
+    }
+  }
+}
 
 export type PersistenceStage =
   | 'before-block-record-write'
@@ -203,6 +300,76 @@ export type CanonicalSpendActivity = Readonly<{
   kind: 'native-value' | 'transaction-fee' | 'selfdestruct'
   amountWei?: string
 }>
+
+/**
+ * Reads fall through to the canonical trie database. Writes stay in this map.
+ * A shallow copy is a nested overlay: it sees parent writes and keeps its own
+ * writes off both the parent map and the canonical database. Storage tries are
+ * created that way, and their checkpoints flush here instead of to Level.
+ *
+ * EthereumJS trie copies default to string values. `new Uint8Array(hex)` is
+ * empty in this Node version, so string values are decoded back to bytes.
+ * Gets return copies so a caller cannot mutate a stored node.
+ */
+function overlayValue(value: Uint8Array | string): Uint8Array {
+  if (typeof value === 'string') {
+    return value.length === 0 ? new Uint8Array() : unprefixedHexToBytes(value)
+  }
+  return new Uint8Array(value)
+}
+
+class ReadOnlyOverlayDB implements DB<string, Uint8Array> {
+  private readonly local = new Map<string, Uint8Array | null>()
+
+  constructor(private readonly base: DB<string, Uint8Array | string>) {}
+
+  async get(key: string, opts?: EncodingOpts): Promise<Uint8Array | undefined> {
+    if (this.local.has(key)) {
+      const value = this.local.get(key)
+      return value === undefined || value === null ? undefined : new Uint8Array(value)
+    }
+    const baseValue = await this.base.get(key, opts)
+    if (baseValue === undefined) return undefined
+    return overlayValue(baseValue)
+  }
+
+  async put(key: string, value: Uint8Array | string): Promise<void> {
+    this.local.set(key, overlayValue(value))
+  }
+
+  async del(key: string): Promise<void> {
+    this.local.set(key, null)
+  }
+
+  async batch(ops: BatchDBOp<string, Uint8Array | string>[]): Promise<void> {
+    for (const op of ops) {
+      if (op.type === 'put') this.local.set(op.key, overlayValue(op.value))
+      else this.local.set(op.key, null)
+    }
+  }
+
+  shallowCopy(): DB<string, Uint8Array> {
+    return new ReadOnlyOverlayDB(this)
+  }
+
+  async open(): Promise<void> {
+    await this.base.open()
+  }
+}
+
+function installReadOnlyOverlay(stateManager: object): void {
+  const trie = (stateManager as { _trie?: { _db?: { db?: DB<string, Uint8Array> } } })._trie
+  const checkpointDb = trie?._db
+  if (
+    checkpointDb?.db === undefined ||
+    typeof checkpointDb.db.get !== 'function' ||
+    typeof checkpointDb.db.put !== 'function' ||
+    typeof checkpointDb.db.shallowCopy !== 'function'
+  ) {
+    throw new ProtocolError('execution copy has no trie database to isolate')
+  }
+  checkpointDb.db = new ReadOnlyOverlayDB(checkpointDb.db)
+}
 
 /**
  * A request-scoped view of one fully replayed canonical chain snapshot.
@@ -349,6 +516,61 @@ export class CanonicalReadView {
 
   getCode(address: Address, blockNumber?: bigint): Promise<Uint8Array> {
     return this.withStateAt(blockNumber, (vm) => vm.stateManager.getCode(address))
+  }
+
+  /**
+   * Copy the VM at a canonical block. The copy reads committed state and keeps
+   * every write in memory. The caller must discard the copy.
+   */
+  async isolateExecutionVm(blockNumber: bigint): Promise<{
+    vm: ReplaySession['vm']
+    block: Block
+  }> {
+    if (blockNumber < 0n || blockNumber > this.session.report.tip.number) {
+      throw new ProtocolError('requested state block is not in the canonical chain')
+    }
+    const operation = this.stateQueryTail.then(async () => {
+      const block = this.session.blocks[Number(blockNumber)]
+      if (block === undefined) throw new ProtocolError('requested canonical state block is missing')
+      await this.session.vm.stateManager.setStateRoot(block.header.stateRoot)
+      const expectedRoot = bytesToHex(block.header.stateRoot)
+      const canonicalRoot = bytesToHex(await this.session.vm.stateManager.getStateRoot())
+      if (canonicalRoot !== expectedRoot) {
+        throw new ProtocolError('canonical state root does not match the selected block')
+      }
+      const vm = await this.session.vm.shallowCopy()
+      installReadOnlyOverlay(vm.stateManager)
+      const copiedRoot = bytesToHex(await vm.stateManager.getStateRoot())
+      if (copiedRoot !== expectedRoot) {
+        throw new ProtocolError('execution copy does not match the selected state root')
+      }
+      return { vm, block }
+    })
+    this.stateQueryTail = operation.then(() => undefined, () => undefined)
+    return operation
+  }
+
+  /** Fail if the selected block's state root is no longer the header root. */
+  async assertCanonicalStateUnchanged(blockNumber: bigint): Promise<void> {
+    if (blockNumber < 0n || blockNumber > this.session.report.tip.number) {
+      throw new ProtocolError('requested state block is not in the canonical chain')
+    }
+    const operation = this.stateQueryTail.then(async () => {
+      const block = this.session.blocks[Number(blockNumber)]
+      if (block === undefined) throw new ProtocolError('requested canonical state block is missing')
+      const expectedRoot = bytesToHex(block.header.stateRoot)
+      try {
+        await this.session.vm.stateManager.setStateRoot(block.header.stateRoot)
+      } catch (error) {
+        throw new ProtocolError(`read-only execution changed canonical state: ${messageOf(error)}`)
+      }
+      const actualRoot = bytesToHex(await this.session.vm.stateManager.getStateRoot())
+      if (actualRoot !== expectedRoot) {
+        throw new ProtocolError('read-only execution changed canonical state')
+      }
+    })
+    this.stateQueryTail = operation.then(() => undefined, () => undefined)
+    return operation
   }
 
   private withStateAt<T>(
@@ -1122,6 +1344,7 @@ export class PersistentBlockProcessor {
   private readonly beforeTipCommit?: () => void | Promise<void>
   private readonly persistenceTestHook?: (stage: PersistenceStage) => void | Promise<void>
   private readonly chainDirectoryLockTimeoutMs: number
+  private readonly depositBackingProvider?: DepositBackingProvider
   private tipValue: ChainTip
   private genesisHashValue: string
   private operationTail: Promise<void> = Promise.resolve()
@@ -1138,6 +1361,7 @@ export class PersistentBlockProcessor {
     this.persistenceTestHook = options.persistenceTestHook
     this.chainDirectoryLockTimeoutMs =
       options.chainDirectoryLockTimeoutMs ?? DEFAULT_CHAIN_DIRECTORY_LOCK_TIMEOUT_MS
+    this.depositBackingProvider = options.depositBackingProvider
     this.tipValue = {
       number: BigInt(metadata.canonicalHeight),
       hash: metadata.canonicalTipHash,
@@ -1354,6 +1578,10 @@ export class PersistentBlockProcessor {
     ]
     return this.withExclusiveOperation(() => this.withStoreLock(async () => {
       await assertDepositRecoveryOpen(this.directory)
+      assertDepositOperationsBacked(
+        canonicalDepositOperations,
+        this.depositBackingProvider,
+      )
       const session = await this.replayCanonical()
       const parent = session.blocks.at(-1)
       if (parent === undefined) throw new ProtocolError('canonical chain is missing genesis')
@@ -1557,6 +1785,10 @@ export class PersistentBlockProcessor {
     const verifiedDepositOperations = verifyEvmDepositPrelude(
       depositOperations,
       block.header.extraData,
+    )
+    assertDepositOperationsBacked(
+      verifiedDepositOperations,
+      this.depositBackingProvider,
     )
     const seenDepositIds = collectCommittedDepositIds(
       session.records.map(({ record }) => record),

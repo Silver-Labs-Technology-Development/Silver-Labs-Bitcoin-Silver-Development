@@ -47,13 +47,13 @@ async function main() {
   log(`   Batch hash: ${batch.batchHash}`)
   
   log('4. Publishing batch data (L1 simulation)...')
-  const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+  const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
   const anchorScript = encodeBtcsL1AnchorScript(batch.batchHash)
   const fragmentScripts = encoded.fragments.map(f => f.scriptPubKeyHex)
   log(`   Fragments: ${encoded.fragments.length}`)
   
   log('5. Clean-node reconstruction...')
-  const recovered = reconstructEvmSettlementBatchFromScripts([anchorScript, ...fragmentScripts], batch.batchHash, ANCHORS)
+  const recovered = await reconstructEvmSettlementBatchFromScripts([anchorScript, ...fragmentScripts], batch.batchHash, ANCHORS)
   if (recovered.batch.batchHash !== batch.batchHash) throw new Error('reconstruction mismatch')
   if (recovered.serializedBatch.toString() !== encoded.serializedBatch.toString()) throw new Error('data mismatch')
   log('   Reconstruction verified')
@@ -65,6 +65,9 @@ async function main() {
     requiredConfirmations: 1,
     operatorAuthorized: true,
     chainId: 'regtest',
+    balanceReader: async () => 10n ** 30n,
+    payoutConfirmationReader: async (txid) => ({ txid, confirmations: 1 }),
+    payoutsEnabled: true,
   })
   
   const req = {
@@ -94,7 +97,7 @@ async function main() {
   log(`   Status: ${w4.status}, txid: ${w4.payoutTxid}`)
   
   log('9. Payout confirmation...')
-  const w5 = await service.confirmPayout(w1.id, 1, 'operator')
+  const w5 = await service.confirmPayout(w1.id, 'operator')
   log(`   Status: ${w5.status}`)
   log(`   Reserved balance: ${service.getReservedBalance(req.l2From)}`)
   
@@ -104,6 +107,9 @@ async function main() {
     requiredConfirmations: 1,
     operatorAuthorized: true,
     chainId: 'regtest',
+    balanceReader: async () => 10n ** 30n,
+    payoutConfirmationReader: async (txid) => ({ txid, confirmations: 1 }),
+    payoutsEnabled: true,
   })
   const w6 = service2.getWithdrawal(w1.id)
   log(`   Recovered status: ${w6?.status}`)

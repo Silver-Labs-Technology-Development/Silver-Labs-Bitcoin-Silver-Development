@@ -7,6 +7,7 @@ import { createEvmSettlementBatch } from '../src/settlementBatch.js'
 import { prepareBtcsL1AnchorForBatch } from '../src/btcsL1AnchorPreparation.js'
 import { BtcsL1CoreRpcClient } from '../src/btcsL1CoreRpc.js'
 import { BtcsL1PublicationStore } from '../src/btcsL1PublicationStore.js'
+import { SettlementContinuityStore } from '../src/settlementContinuity.js'
 import { invalidateBtcsL1PublicationAfterConfirmedReorg, verifyAndAdvanceBtcsL1PublicationInStore } from '../src/btcsL1PublicationWorkflow.js'
 
 const HOST = '127.0.0.1'
@@ -14,6 +15,7 @@ const PORT = Number(process.env.BTCS_L2_REGTEST_PORT ?? 29443)
 const WALLET = process.env.BTCS_L2_REGTEST_WALLET ?? 'btcs-l2-anchor-regtest'
 const DATADIR = process.env.BTCS_L2_REGTEST_DATADIR ?? join(homedir(), '.local', 'share', 'btcs-l2-regtest-core')
 const PUBLICATION_STORE_DIR = process.env.BTCS_L2_PUBLICATION_STORE_DIR ?? join(homedir(), '.local', 'share', 'btcs-l2-regtest-publications')
+const CONTINUITY_STORE_DIR = process.env.BTCS_L2_CONTINUITY_STORE_DIR ?? join(homedir(), '.local', 'share', 'btcs-l2-regtest-continuity')
 const REORG_TEST = process.env.BTCS_L2_REGTEST_REORG_TEST === '1'
 const ZERO_HASH = `0x${'0'.repeat(64)}`
 
@@ -45,35 +47,53 @@ async function prepareVerifiedAnchor(timestamp: bigint) {
     )
     const batch = createEvmSettlementBatch([envelope0, envelope1])
 
-    return await prepareBtcsL1AnchorForBatch(
+    return {
+      preparation: await prepareBtcsL1AnchorForBatch(
+        batch,
+        ZERO_COMMITMENT,
+        ZERO_HASH,
+        '0',
+      ),
       batch,
-      ZERO_COMMITMENT,
-      ZERO_HASH,
-      '0',
-    )
+    }
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
 }
 
-async function openOrCreatePublicationStore() {
+async function openOrCreateContinuityStore(): Promise<SettlementContinuityStore> {
+  try {
+    await lstat(CONTINUITY_STORE_DIR)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return SettlementContinuityStore.create(CONTINUITY_STORE_DIR)
+  }
+  return SettlementContinuityStore.open(CONTINUITY_STORE_DIR)
+}
+
+async function openOrCreatePublicationStore(
+  continuity: SettlementContinuityStore,
+) {
   try {
     await lstat(PUBLICATION_STORE_DIR)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    return BtcsL1PublicationStore.create(PUBLICATION_STORE_DIR)
+    return BtcsL1PublicationStore.create(PUBLICATION_STORE_DIR, continuity)
   }
   // Existing but missing/corrupt store files must fail closed.
-  return BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+  return BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR, continuity)
 }
 
 async function main() {
   if (REORG_TEST) {
     const expectedDatadir = join(homedir(), '.local', 'share', 'btcs-l2-regtest-reorg-20261011')
     const expectedStore = join(homedir(), '.local', 'share', 'btcs-l2-regtest-reorg-publications-20261011')
+    const expectedContinuity = join(homedir(), '.local', 'share', 'btcs-l2-regtest-reorg-continuity-20261011')
     if (PORT !== 29444 || resolve(DATADIR) !== resolve(expectedDatadir) ||
-      resolve(PUBLICATION_STORE_DIR) !== resolve(expectedStore) || WALLET !== 'btcs-l2-reorg-test') {
-      throw new Error('Safety stop: reorg test must use port 29444, the disposable reorg datadir/store, and wallet btcs-l2-reorg-test')
+      resolve(PUBLICATION_STORE_DIR) !== resolve(expectedStore) ||
+      resolve(CONTINUITY_STORE_DIR) !== resolve(expectedContinuity) ||
+      WALLET !== 'btcs-l2-reorg-test') {
+      throw new Error('Safety stop: reorg test must use port 29444, the disposable reorg datadir/stores, and wallet btcs-l2-reorg-test')
     }
   }
 
@@ -128,13 +148,15 @@ async function main() {
   }
 
   await rpc('getwalletinfo', [], true)
-  const publicationStore = await openOrCreatePublicationStore()
+  const continuity = await openOrCreateContinuityStore()
+  const publicationStore = await openOrCreatePublicationStore(continuity)
   console.log('PASS: connected to local BTCS regtest and test wallet')
   console.log(`RPC port: ${PORT}; wallet: ${WALLET}`)
   console.log(`Data directory: ${DATADIR}`)
   console.log(`Publication store: ${PUBLICATION_STORE_DIR}`)
+  console.log(`Continuity store: ${CONTINUITY_STORE_DIR}`)
 
-  const preparation = await prepareVerifiedAnchor(
+  const { preparation, batch } = await prepareVerifiedAnchor(
     BigInt(Math.floor(Date.now() / 1000)),
   )
   if (preparation.executionVerified !== true) {
@@ -144,6 +166,15 @@ async function main() {
   if (existingPublication !== undefined && existingPublication.state !== 'prepared') {
     throw new Error(
       `Publication already exists for this batch in state ${existingPublication.state}`,
+    )
+  }
+  if (
+    existingPublication === undefined &&
+    continuity.getCursor() !== null
+  ) {
+    throw new Error(
+      'Safety stop: the continuity store already contains a different history; ' +
+      'use a fresh isolated BTCS_L2_CONTINUITY_STORE_DIR for a new genesis E2E run',
     )
   }
   if (existingPublication === undefined) {
@@ -230,9 +261,13 @@ async function main() {
     publicationStore,
     preparation.batchHash,
     blockHash,
+    batch,
   )
 
-  const reopenedStore = await BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+  const reopenedStore = await BtcsL1PublicationStore.open(
+    PUBLICATION_STORE_DIR,
+    continuity,
+  )
   const recovered = reopenedStore.get(preparation.batchHash)
   if (recovered === undefined) {
     throw new Error('Publication was missing after reopening the store')
@@ -276,7 +311,10 @@ async function main() {
     if (invalidatedPublication.state !== 'invalidated') {
       throw new Error(`Expected invalidated state; received ${invalidatedPublication.state}`)
     }
-    const reopenedInvalidatedStore = await BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+    const reopenedInvalidatedStore = await BtcsL1PublicationStore.open(
+      PUBLICATION_STORE_DIR,
+      continuity,
+    )
     const recoveredInvalidated = reopenedInvalidatedStore.get(preparation.batchHash)
     if (recoveredInvalidated === undefined || recoveredInvalidated.state !== 'invalidated' ||
       JSON.stringify(recoveredInvalidated) !== JSON.stringify(invalidatedPublication)) {
@@ -336,12 +374,19 @@ async function main() {
       throw new Error('Safety stop: anchor transaction was not re-included within three recovery blocks')
     }
     const reobservedPublication = await verifyAndAdvanceBtcsL1PublicationInStore(
-      confirmationRpc, publicationStore, preparation.batchHash, reincludeBlockHash,
+      confirmationRpc,
+      publicationStore,
+      preparation.batchHash,
+      reincludeBlockHash,
+      batch,
     )
     if (reobservedPublication.state !== 'confirmed' || reobservedPublication.blockHash !== reincludeBlockHash) {
       throw new Error('Publication did not recover to confirmed state on its replacement inclusion')
     }
-    const reopenedRecoveredStore = await BtcsL1PublicationStore.open(PUBLICATION_STORE_DIR)
+    const reopenedRecoveredStore = await BtcsL1PublicationStore.open(
+      PUBLICATION_STORE_DIR,
+      continuity,
+    )
     const durableRecovery = reopenedRecoveredStore.get(preparation.batchHash)
     if (durableRecovery === undefined || durableRecovery.state !== 'confirmed' ||
       JSON.stringify(durableRecovery) !== JSON.stringify(reobservedPublication)) {

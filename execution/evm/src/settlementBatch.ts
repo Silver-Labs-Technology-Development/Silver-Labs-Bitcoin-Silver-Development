@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import {
   EvmSettlementEnvelope,
+  ZERO_COMMITMENT,
   verifyEvmSettlementEnvelope,
 } from './settlementEnvelope.js'
 import { ProtocolError } from './blockProcessor.js'
@@ -139,6 +140,13 @@ export function createEvmSettlementBatch(
     first.parentHash,
   )
 
+  if (
+    verified[0]!.height === '0' &&
+    verified[0]!.previousCommitment !== ZERO_COMMITMENT
+  ) {
+    throw new ProtocolError('genesis batch must use the zero previous commitment')
+  }
+
   const fields: Omit<EvmSettlementBatch, 'batchHash'> = {
     format: EVM_SETTLEMENT_BATCH_FORMAT,
     version: EVM_SETTLEMENT_BATCH_VERSION,
@@ -219,6 +227,9 @@ export function verifyEvmSettlementBatch(
   const first = verified[0]!
   const last = verified[verified.length - 1]!
 
+  if (first.height === '0' && first.previousCommitment !== ZERO_COMMITMENT) {
+    throw new ProtocolError('genesis batch must use the zero previous commitment')
+  }
   if (first.height !== expectedStartHeight) {
     throw new ProtocolError('batch start height does not match the expected starting height')
   }

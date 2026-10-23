@@ -9,6 +9,10 @@ import {
   reobserveBtcsL1Publication,
   type BtcsL1PublicationRecord,
 } from './btcsL1Publication.js'
+import {
+  type SettlementContinuityCheckpoint,
+  type SettlementContinuityCursor,
+} from './settlementContinuity.js'
 
 /**
  * Verify an existing transaction's active-chain inclusion and anchor before
@@ -52,7 +56,8 @@ export async function verifyAndAdvanceBtcsL1Publication(
   if (
     report.format !== 'btcs-l2-btcs-l1-confirmation' ||
     report.version !== 1 ||
-    report.verificationModel !== 'trusted-btcs-core-rpc' ||
+    (report.verificationModel !== 'trusted-btcs-core-rpc' &&
+      report.verificationModel !== 'trusted-btcs-core-rpc+local-inclusion-proof') ||
     report.txid !== record.txid ||
     report.blockHash !== blockHash ||
     report.batchHash !== record.batchHash ||
@@ -91,12 +96,17 @@ export async function verifyAndAdvanceBtcsL1Publication(
  *
  * No record is changed if the RPC call or confirmation verification fails.
  * The store's serialized transitions also reject stale/conflicting updates.
+ *
+ * `batchValue` is mandatory: the publication store itself enforces settlement
+ * continuity before it can persist an observed or confirmed state.
  */
 export async function verifyAndAdvanceBtcsL1PublicationInStore(
   rpc: BtcsL1ConfirmationRpc,
   store: BtcsL1PublicationStore,
   batchHash: string,
   blockHash: string,
+  batchValue: unknown,
+  checkpoint?: SettlementContinuityCheckpoint,
 ): Promise<BtcsL1PublicationRecord> {
   const current = store.get(batchHash)
   if (current === undefined) {
@@ -125,6 +135,8 @@ export async function verifyAndAdvanceBtcsL1PublicationInStore(
       verified.blockHash,
       verified.blockHeight,
       verified.confirmations,
+      batchValue,
+      checkpoint,
     )
   }
 
@@ -133,7 +145,47 @@ export async function verifyAndAdvanceBtcsL1PublicationInStore(
     verified.blockHash,
     verified.blockHeight,
     verified.confirmations,
+    batchValue,
+    checkpoint,
   )
+}
+
+/**
+ * Confirm an L1 publication and advance settlement continuity as one guarded
+ * workflow.
+ *
+ * The publication store is permanently bound to a settlement-continuity store.
+ * It replays the exact batch before either durable store changes and commits
+ * continuity before persisting `confirmed`. A gap, overlap, fork, missing
+ * checkpoint, or execution mismatch therefore leaves the publication record
+ * unchanged and cannot produce a confirmed record.
+ *
+ * This function still relies on the trusted BTCS Core RPC boundary and does not
+ * prove L1 consensus, finality, or trustless settlement.
+ */
+export async function verifyAndAdvanceBtcsL1PublicationWithContinuity(
+  rpc: BtcsL1ConfirmationRpc,
+  store: BtcsL1PublicationStore,
+  batchHash: string,
+  blockHash: string,
+  batchValue: unknown,
+  checkpoint?: SettlementContinuityCheckpoint,
+): Promise<Readonly<{
+  publication: BtcsL1PublicationRecord
+  continuityCursor: SettlementContinuityCursor | null
+}>> {
+  const publication = await verifyAndAdvanceBtcsL1PublicationInStore(
+    rpc,
+    store,
+    batchHash,
+    blockHash,
+    batchValue,
+    checkpoint,
+  )
+  return {
+    publication,
+    continuityCursor: store.getContinuityCursor(),
+  }
 }
 
 /**

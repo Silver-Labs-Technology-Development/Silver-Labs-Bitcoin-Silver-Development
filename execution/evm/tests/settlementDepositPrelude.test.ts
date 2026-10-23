@@ -6,6 +6,7 @@ import test from 'node:test'
 import {
   GENESIS_TIMESTAMP,
   PersistentBlockProcessor,
+  createStaticDepositBackingProvider,
 } from '../src/blockProcessor.js'
 import {
   BTCS_L1_DEPOSIT_RECORD_FORMAT,
@@ -47,7 +48,9 @@ test('settlement v2 carries deposit operations and independently replays their c
   const root = await mkdtemp(join(tmpdir(), 'btcs-l2-settlement-deposit-'))
 
   try {
-    const source = await PersistentBlockProcessor.open(join(root, 'source'))
+    const source = await PersistentBlockProcessor.open(join(root, 'source'), {
+      depositBackingProvider: createStaticDepositBackingProvider([makeRecord()]),
+    })
     const genesis = await source.getCanonicalBlockByNumber(0n)
     assert.ok(genesis)
 
@@ -93,7 +96,21 @@ test('checkpoint settlement replay applies deposit operations after the checkpoi
   const root = await mkdtemp(join(tmpdir(), 'btcs-l2-settlement-checkpoint-deposit-'))
 
   try {
-    const source = await PersistentBlockProcessor.open(join(root, 'source'))
+    const secondTxid = 'c'.repeat(64)
+    const secondRecord: BtcsL1DepositRecord = {
+      ...makeRecord(),
+      depositId: `${secondTxid}:0`,
+      txid: secondTxid,
+      recipientAddress: `0x${'2'.repeat(40)}`,
+      blockHash: 'd'.repeat(64),
+      blockHeight: 201,
+    }
+    const source = await PersistentBlockProcessor.open(join(root, 'source'), {
+      depositBackingProvider: createStaticDepositBackingProvider([
+        makeRecord(),
+        secondRecord,
+      ]),
+    })
     const genesis = await source.getCanonicalBlockByNumber(0n)
     assert.ok(genesis)
 
@@ -113,15 +130,7 @@ test('checkpoint settlement replay applies deposit operations after the checkpoi
     const checkpointDirectory = join(root, 'checkpoint')
     await source.exportStateCheckpoint(checkpointDirectory)
 
-    const secondTxid = 'c'.repeat(64)
-    const secondOperation = createEvmDepositOperation({
-      ...makeRecord(),
-      depositId: `${secondTxid}:0`,
-      txid: secondTxid,
-      recipientAddress: `0x${'2'.repeat(40)}`,
-      blockHash: 'd'.repeat(64),
-      blockHeight: 201,
-    })
+    const secondOperation = createEvmDepositOperation(secondRecord)
 
     const child = await source.buildNextBlock(
       [],
@@ -160,7 +169,9 @@ test('settlement envelope rejects a missing or altered deposit operation list', 
   const root = await mkdtemp(join(tmpdir(), 'btcs-l2-settlement-deposit-tamper-'))
 
   try {
-    const source = await PersistentBlockProcessor.open(join(root, 'source'))
+    const source = await PersistentBlockProcessor.open(join(root, 'source'), {
+      depositBackingProvider: createStaticDepositBackingProvider([makeRecord()]),
+    })
     const operation = createEvmDepositOperation(makeRecord())
     const child = await source.buildNextBlock(
       [],

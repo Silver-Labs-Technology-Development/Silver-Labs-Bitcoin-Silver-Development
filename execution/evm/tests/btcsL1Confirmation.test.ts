@@ -6,6 +6,13 @@ import {
   type BtcsL1ConfirmationRequest,
   type BtcsL1ConfirmationRpc,
 } from '../src/btcsL1Confirmation.js'
+import {
+  HEIGHT_556_HASH,
+  HEIGHT_556_MERKLE_ROOT,
+  HEIGHT_556_PREVIOUS_HASH,
+  REAL_PROOF,
+  REAL_TXID,
+} from './fixtures/btcsL1ProofFixture.js'
 
 const txid = '1'.repeat(64)
 const blockHash = '2'.repeat(64)
@@ -54,6 +61,7 @@ test('verifies an active-chain anchor with sufficient confirmations', async () =
 
   assert.equal(report.format, 'btcs-l2-btcs-l1-confirmation')
   assert.equal(report.verificationModel, 'trusted-btcs-core-rpc')
+  assert.equal(report.inclusionProofVerified, false)
   assert.equal(report.txid, txid)
   assert.equal(report.blockHash, blockHash)
   assert.equal(report.blockHeight, 120)
@@ -164,5 +172,93 @@ test('rejects invalid confirmation requirements', async () => {
       requiredConfirmations: 0,
     }),
     /positive safe integer/,
+  )
+})
+
+function makeRealProofRpc(options: {
+  proof?: unknown
+  blockHash?: string
+  headerMerkleRoot?: string
+  headerPreviousHash?: string
+} = {}): BtcsL1ConfirmationRpc {
+  const blockHash = options.blockHash ?? HEIGHT_556_HASH
+  return {
+    async getRawTransaction() {
+      return {
+        txid: REAL_TXID,
+        blockhash: blockHash,
+        in_active_chain: true,
+        confirmations: 10,
+        vout: [{ scriptPubKey: { hex: encodeBtcsL1AnchorScript(batchHash) } }],
+      }
+    },
+    async getBlockHeader() {
+      return {
+        hash: blockHash,
+        height: 556,
+        confirmations: 10,
+        merkleroot: options.headerMerkleRoot ?? HEIGHT_556_MERKLE_ROOT,
+        previousblockhash: options.headerPreviousHash ?? HEIGHT_556_PREVIOUS_HASH,
+      }
+    },
+    async getTxOutProof() {
+      return options.proof ?? REAL_PROOF
+    },
+  }
+}
+
+const realProofRequest: BtcsL1ConfirmationRequest = {
+  txid: REAL_TXID,
+  blockHash: HEIGHT_556_HASH,
+  batchHash,
+  requiredConfirmations: 6,
+}
+
+test('verifies a real local inclusion proof when the RPC exposes gettxoutproof', async () => {
+  const report = await verifyBtcsL1AnchorConfirmation(makeRealProofRpc(), realProofRequest)
+  assert.equal(
+    report.verificationModel,
+    'trusted-btcs-core-rpc+local-inclusion-proof',
+  )
+  assert.equal(report.inclusionProofVerified, true)
+  assert.equal(report.txid, REAL_TXID)
+  assert.equal(report.blockHash, HEIGHT_556_HASH)
+})
+
+test('rejects a malformed, wrong-transaction, or wrong-block inclusion proof', async () => {
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(makeRealProofRpc({ proof: '00' }), realProofRequest),
+    /too short|invalid/,
+  )
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(
+      makeRealProofRpc({ proof: REAL_PROOF }),
+      { ...realProofRequest, txid: '4'.repeat(64) },
+    ),
+    /different txid/,
+  )
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(
+      makeRealProofRpc({ proof: REAL_PROOF, blockHash: '5'.repeat(64) }),
+      { ...realProofRequest, blockHash: '5'.repeat(64) },
+    ),
+    /does not match the expected block hash/,
+  )
+})
+
+test('rejects proof/header Merkle-root or previous-hash disagreement', async () => {
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(
+      makeRealProofRpc({ headerMerkleRoot: '6'.repeat(64) }),
+      realProofRequest,
+    ),
+    /merkle root does not match/,
+  )
+  await assert.rejects(
+    verifyBtcsL1AnchorConfirmation(
+      makeRealProofRpc({ headerPreviousHash: '7'.repeat(64) }),
+      realProofRequest,
+    ),
+    /previous hash does not match/,
   )
 })

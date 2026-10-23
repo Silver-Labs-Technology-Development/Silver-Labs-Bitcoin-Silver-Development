@@ -102,7 +102,8 @@ function validateReport(
   if (
     report.format !== 'btcs-l2-btcs-l1-deposit-verification' ||
     report.version !== 1 ||
-    report.verificationModel !== 'trusted-btcs-core-rpc' ||
+    (report.verificationModel !== 'trusted-btcs-core-rpc' &&
+      report.verificationModel !== 'trusted-btcs-core-rpc+local-inclusion-proof') ||
     report.activeChain !== true ||
     report.depositVerified !== true
   ) {

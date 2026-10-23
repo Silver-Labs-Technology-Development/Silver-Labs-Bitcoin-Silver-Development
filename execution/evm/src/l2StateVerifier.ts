@@ -15,54 +15,60 @@ export type MaliciousBatchAttempt = Readonly<{
   shouldReject: true
 }>
 
+/**
+ * Replays and independently re-executes the full canonical chain through the
+ * block processor, which validates headers, transactions, receipts, execution
+ * outcomes, and state roots. This does not prove BTCS L1 publication, data
+ * availability, finality, or settlement.
+ */
 export async function replayAndVerify(
   chain: PersistentBlockProcessor,
   fromHeight: bigint = 0n,
   toHeight?: bigint
 ): Promise<ReplayVerificationResult> {
-  const view = await chain.createCanonicalReadView()
   const errors: string[] = []
-  const checked: string[] = []
-  
-  checked.push('load_canonical_chain')
-  
-  // Verify genesis exists
-  const genesis = view.getCanonicalBlockByNumber(0n)
-  if (!genesis) {
-    errors.push('missing genesis')
-  } else {
-    checked.push('verify_genesis')
-  }
-  
-  // Find height by scanning
-  let height = 0n
-  let h = 1n
-  while (view.getCanonicalBlockByNumber(h)) {
-    height = h
-    h++
-    if (h > 10000n) break
-  }
-  
-  // Verify chain continuity
-  const limit = toHeight !== undefined && toHeight < height ? toHeight : height
-  for (let bh = 1n; bh <= limit; bh++) {
-    const block = view.getCanonicalBlockByNumber(bh)
-    if (!block) {
-      errors.push(`missing block at height ${bh}`)
-      break
+  const checked: string[] = [
+    'load_canonical_chain',
+    'verify_genesis',
+    'reexecute_canonical_blocks',
+    'verify_receipts_and_state_roots',
+  ]
+
+  try {
+    if (fromHeight < 0n || (toHeight !== undefined && toHeight < fromHeight)) {
+      throw new ProtocolError('invalid replay height range')
     }
-  }
-  checked.push('verify_chain_continuity')
-  
-  const tip = view.getCanonicalBlockByNumber(limit)
-  const stateRoot = tip ? '0x' + '00'.repeat(32) : ''
-  
-  return {
-    valid: errors.length === 0,
-    height: limit,
-    stateRoot,
-    checked,
-    errors,
+    const report = await chain.replay()
+    const tip = report.tip
+    if (fromHeight > tip.number) {
+      throw new ProtocolError('replay start height is above the canonical tip')
+    }
+    const requestedEnd = toHeight === undefined || toHeight > tip.number
+      ? tip.number
+      : toHeight
+    if (requestedEnd > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new ProtocolError('replay height exceeds the supported range')
+    }
+    const summary = report.blocks[Number(requestedEnd)]
+    if (summary === undefined) {
+      throw new ProtocolError('replay did not produce the requested block summary')
+    }
+    return {
+      valid: true,
+      height: requestedEnd,
+      stateRoot: summary.stateRoot,
+      checked,
+      errors,
+    }
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error))
+    return {
+      valid: false,
+      height: 0n,
+      stateRoot: '',
+      checked,
+      errors,
+    }
   }
 }
 

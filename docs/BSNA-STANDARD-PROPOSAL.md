@@ -1,6 +1,6 @@
 # Bitcoin Silver Native Assets (BSNA) Standard Proposal v1.0 (Draft)
 
-Status: **PROPOSED** - Not implemented  
+Status: **PROPOSED RECOGNITION LAYER** — `IBSNA` and the BSNA-20 / BSNA-721 reference contracts now exist. They are not BSNA-FTS1. The fungible product standard is drafted separately in `docs/BSNA-FTS1-PROPOSAL.md` and is not implemented.
 Date: 2026-10-22  
 Branch: experimental/deposit-prelude-v1
 

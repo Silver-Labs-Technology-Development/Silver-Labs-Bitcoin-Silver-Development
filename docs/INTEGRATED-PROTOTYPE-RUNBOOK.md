@@ -127,8 +127,10 @@ a store reopen.
 
 ## Known limits
 
-- Trust model: L1 verification trusts local Core RPC; no SPV or trustless
-  inclusion proof.
+- Trust model: L1 verification trusts local Core RPC for the header and active
+  chain. A local partial Merkle proof is verified when `gettxoutproof` is
+  available, but there is no canonical/most-work SPV selection, peer consensus,
+  or finality proof.
 - No withdrawals/exit path, censorship resistance, or fraud/validity proof
   architecture yet.
 - Source-specific attribution among fungible deposit credits is partial; reorg

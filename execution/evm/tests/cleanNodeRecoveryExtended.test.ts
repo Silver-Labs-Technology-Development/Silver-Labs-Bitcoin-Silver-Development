@@ -32,14 +32,14 @@ test('clean-node recovery extended: restart simulation - reconstruct after "rest
     assert.ok(child)
     const envelope1 = createEvmSettlementEnvelope((child as any).blockRlpHex ?? (child as any).block?.blockRlpHex, envelope0.commitmentHash)
     const batch = createEvmSettlementBatch([envelope0, envelope1])
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     const anchorScript = encodeBtcsL1AnchorScript(batch.batchHash)
     const fragmentScripts = encoded.fragments.map(f => f.scriptPubKeyHex)
     
     // First reconstruction
-    const recovered1 = reconstructEvmSettlementBatchFromScripts([anchorScript, ...fragmentScripts], batch.batchHash, ANCHORS)
+    const recovered1 = await reconstructEvmSettlementBatchFromScripts([anchorScript, ...fragmentScripts], batch.batchHash, ANCHORS)
     // Simulate restart - reconstruct again from same artifacts
-    const recovered2 = reconstructEvmSettlementBatchFromScripts([anchorScript, ...fragmentScripts], batch.batchHash, ANCHORS)
+    const recovered2 = await reconstructEvmSettlementBatchFromScripts([anchorScript, ...fragmentScripts], batch.batchHash, ANCHORS)
     
     assert.equal(recovered1.batch.batchHash, recovered2.batch.batchHash)
     assert.equal(recovered1.serializedBatch.toString(), recovered2.serializedBatch.toString())
@@ -63,11 +63,11 @@ test('clean-node recovery extended: incomplete artifacts cannot become finalized
     assert.ok(child)
     const envelope1 = createEvmSettlementEnvelope((child as any).blockRlpHex ?? (child as any).block?.blockRlpHex, envelope0.commitmentHash)
     const batch = createEvmSettlementBatch([envelope0, envelope1])
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     
     const scripts = encoded.fragments.slice(0, Math.floor(encoded.fragments.length/2)).map(f => f.scriptPubKeyHex)
-    assert.throws(() => {
-      reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
+    await assert.rejects(async () => {
+      await reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
     })
   } finally {
     await rm(sequencerDir, { recursive: true, force: true })
@@ -89,13 +89,13 @@ test('clean-node recovery extended: conflicting fragments rejected', async () =>
     assert.ok(child)
     const envelope1 = createEvmSettlementEnvelope((child as any).blockRlpHex ?? (child as any).block?.blockRlpHex, envelope0.commitmentHash)
     const batch = createEvmSettlementBatch([envelope0, envelope1])
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     
     // Create conflicting fragment by duplicating with different data
     const scripts = [...encoded.fragments.map(f => f.scriptPubKeyHex)]
     scripts[1] = scripts[0].replace(/[0-9a-f]$/i, 'c')
     try {
-      reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
+      await reconstructEvmSettlementBatchFromScripts(scripts, batch.batchHash, ANCHORS)
       assert.fail('should throw')
     } catch (e) {
       assert.ok(e instanceof Error)
@@ -120,12 +120,12 @@ test('clean-node recovery extended: interrupted reconstruction cannot be finaliz
     assert.ok(child)
     const envelope1 = createEvmSettlementEnvelope((child as any).blockRlpHex ?? (child as any).block?.blockRlpHex, envelope0.commitmentHash)
     const batch = createEvmSettlementBatch([envelope0, envelope1])
-    const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+    const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
     const anchorScript = encodeBtcsL1AnchorScript(batch.batchHash)
     
     // Only anchor, no fragments
-    assert.throws(() => {
-      reconstructEvmSettlementBatchFromScripts([anchorScript], batch.batchHash, ANCHORS)
+    await assert.rejects(async () => {
+      await reconstructEvmSettlementBatchFromScripts([anchorScript], batch.batchHash, ANCHORS)
     })
   } finally {
     await rm(sequencerDir, { recursive: true, force: true })

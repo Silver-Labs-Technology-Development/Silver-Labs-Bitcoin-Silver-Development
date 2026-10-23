@@ -18,6 +18,12 @@ import {
   invalidateBtcsL1DepositAfterConfirmedReorg,
   verifyAndRecordBtcsL1Deposit,
 } from './btcsL1DepositWorkflow.js'
+import {
+  DEPOSIT_RECOVERY_GATE_FORMAT,
+  DEPOSIT_RECOVERY_GATE_VERSION,
+  readDepositRecoveryGate,
+  writeDepositRecoveryGate,
+} from './depositRecoveryGate.js'
 
 const HASH_RE = /^[0-9a-f]{64}$/
 const SCRIPT_RE = /^(?:[0-9a-f]{2})+$/
@@ -216,6 +222,7 @@ export class BtcsL1DepositWatcher {
     private readonly config: BtcsL1DepositWatchConfig,
     private readonly maxBlocksPerPoll: number,
     private readonly releaseDirectoryLocks: ReleaseDirectoryLock,
+    private readonly chainDirectory?: string,
   ) {}
 
   static async create(options: Readonly<{
@@ -227,6 +234,8 @@ export class BtcsL1DepositWatcher {
     startHeight: number
     reorgWindowBlocks?: number
     maxBlocksPerPoll?: number
+    /** When set, a deep reorg durably freezes this L2 chain store. */
+    chainDirectory?: string
   }>): Promise<BtcsL1DepositWatcher> {
     const config = makeConfig(options)
     const cursorDirectory = resolve(options.cursorDirectory)
@@ -272,6 +281,9 @@ export class BtcsL1DepositWatcher {
             await releaseCursorLock()
           }
         },
+        options.chainDirectory === undefined
+          ? undefined
+          : resolve(options.chainDirectory),
       )
     } catch (error) {
       try {
@@ -292,6 +304,8 @@ export class BtcsL1DepositWatcher {
     startHeight: number
     reorgWindowBlocks?: number
     maxBlocksPerPoll?: number
+    /** When set, a deep reorg durably freezes this L2 chain store. */
+    chainDirectory?: string
   }>): Promise<BtcsL1DepositWatcher> {
     const config = makeConfig(options)
     const cursorDirectory = resolve(options.cursorDirectory)
@@ -324,6 +338,9 @@ export class BtcsL1DepositWatcher {
             await releaseCursorLock()
           }
         },
+        options.chainDirectory === undefined
+          ? undefined
+          : resolve(options.chainDirectory),
       )
     } catch (error) {
       try {
@@ -373,6 +390,7 @@ export class BtcsL1DepositWatcher {
     if (activeCursorHash !== cursorTip.hash) {
       const ancestor = await this.findCommonAncestor(initialHistory, tip.blocks)
       if (ancestor === undefined) {
+        await this.freezeChainAfterDeepReorg(cursorTip.height)
         throw new BtcsL1DepositWatcherDeepReorgError(
           'active chain diverged deeper than the retained watcher history; cursor and deposits were not changed',
         )
@@ -454,6 +472,20 @@ export class BtcsL1DepositWatcher {
       await this.cursor.appendBlock(height, hash)
     }
 
+    const unresolvedInvalidations = this.chainDirectory === undefined
+      ? []
+      : this.deposits
+          .list()
+          .filter((record) => record.state === 'invalidated')
+          .map((record) => record.depositId)
+          .sort()
+    if (unresolvedInvalidations.length > 0) {
+      await this.freezeChainAfterInvalidatedDeposit(
+        unresolvedInvalidations,
+        tip.blocks,
+      )
+    }
+
     return {
       chain: tip.chain,
       tipHeight: tip.blocks,
@@ -466,6 +498,43 @@ export class BtcsL1DepositWatcher {
       ignoredCandidateTransactions,
       ...(commonAncestorHeight === undefined ? {} : { commonAncestorHeight }),
     }
+  }
+
+  private async freezeChainAfterInvalidatedDeposit(
+    depositIds: readonly string[],
+    engagedAtHeight: number,
+  ): Promise<void> {
+    if (this.chainDirectory === undefined) return
+    const existing = await readDepositRecoveryGate(this.chainDirectory)
+      .catch(() => undefined)
+    if (existing !== undefined) return
+    await writeDepositRecoveryGate(this.chainDirectory, {
+      format: DEPOSIT_RECOVERY_GATE_FORMAT,
+      version: DEPOSIT_RECOVERY_GATE_VERSION,
+      status: 'frozen',
+      reason:
+        'confirmed BTCS L1 deposit inclusion was invalidated and not re-included; L2 recovery required',
+      involvedDepositIds: [...depositIds].sort(),
+      engagedAtHeight: engagedAtHeight.toString(10),
+    })
+  }
+
+  private async freezeChainAfterDeepReorg(engagedAtHeight: number): Promise<void> {
+    if (this.chainDirectory === undefined) return
+    const involvedDepositIds = this.deposits
+      .list()
+      .filter((record) => record.state === 'confirmed')
+      .map((record) => record.depositId)
+      .sort()
+    await writeDepositRecoveryGate(this.chainDirectory, {
+      format: DEPOSIT_RECOVERY_GATE_FORMAT,
+      version: DEPOSIT_RECOVERY_GATE_VERSION,
+      status: 'frozen',
+      reason:
+        'BTCS L1 active chain diverged deeper than retained watcher history; operator recovery required',
+      involvedDepositIds,
+      engagedAtHeight: engagedAtHeight.toString(10),
+    })
   }
 
   private async findCommonAncestor(

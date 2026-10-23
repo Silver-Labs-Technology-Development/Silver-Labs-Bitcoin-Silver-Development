@@ -21,6 +21,8 @@ import { AssetService } from './service.js'
 import { IpfsStorageProvider } from './storage/ipfsProvider.js'
 import { LocalObjectStore } from './storage/localStore.js'
 import type { StorageProvider } from './storage/provider.js'
+import { AssetEngineService, createAssetEngineServiceFromEnv } from './assetEngineService.js'
+import { AssetEngineError } from 'btcs-l2-v010-evm-harness/assetEngine/errors.js'
 import {
   SUPPORTED_ASSET_IMAGE_KINDS,
   SUPPORTED_IMAGE_FORMATS,
@@ -34,10 +36,23 @@ export const LIMITS_PATH = '/api/assets/images/limits'
 export const OBJECT_PATH_PREFIX = '/assets/objects/'
 export const HEALTH_PATH = '/healthz'
 
+// Asset Engine routes
+export const ENGINE_NETWORKS_PATH = '/api/asset-engine/networks'
+export const ENGINE_CONNECT_PATH = '/api/asset-engine/connect'
+export const ENGINE_CONNECTION_PATH = '/api/asset-engine/connection'
+export const ENGINE_ESTIMATE_FEES_PATH = '/api/asset-engine/estimate-fees'
+export const ENGINE_DEPLOY_PATH = '/api/asset-engine/deploy'
+export const ENGINE_DEPLOYMENTS_PATH = '/api/asset-engine/deployments'
+export const ENGINE_ATTACH_LOGO_PATH = '/api/asset-engine/attach-logo'
+export const ENGINE_MINT_PATH = '/api/asset-engine/mint'
+export const ENGINE_LOGOS_PATH_PREFIX = '/api/asset-engine/logos/'
+
 export type AssetServerOptions = {
   service: AssetService
   /** Local object store used to serve `GET /assets/objects/<digest>`. */
   localObjectStore?: LocalObjectStore | undefined
+  /** Asset engine service for deployment and registry operations. */
+  assetEngineService?: AssetEngineService | undefined
   /** Origins allowed to call the API from a browser. */
   allowedOrigins: readonly string[]
   /** Maximum accepted request body size. */
@@ -77,7 +92,7 @@ function sendJson(
 ): void {
   if (response.headersSent || response.destroyed) return
   setCommonHeaders(response, allowedOrigins)
-  const serialized = JSON.stringify(body)
+  const serialized = JSON.stringify(body, (_key, value) => (typeof value === 'bigint' ? value.toString(10) : value));
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(serialized),
@@ -298,6 +313,273 @@ async function handleObject(
   response.end(Buffer.from(object.data))
 }
 
+async function handleEngineNetworks(
+  options: AssetServerOptions,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const networks = await engine.getNetworks()
+  sendJson(response, 200, { ok: true, networks }, options.allowedOrigins)
+}
+
+async function handleEngineConnect(
+  options: AssetServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const body = await readBody(request, options.maxRequestBytes)
+  const parsed = JSON.parse(body.toString('utf8')) as { networkId?: string; rpcUrl?: string }
+  if (!parsed.networkId) {
+    throw AssetServiceError.invalidRequest('networkId is required', { field: 'networkId' })
+  }
+  const connection = await engine.connect(parsed.networkId, parsed.rpcUrl)
+  sendJson(response, 200, { ok: true, connection }, options.allowedOrigins)
+}
+
+async function handleEngineConnection(
+  options: AssetServerOptions,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const connection = engine.getConnection()
+  sendJson(response, 200, { ok: true, connection }, options.allowedOrigins)
+}
+
+async function handleEngineEstimateFees(
+  options: AssetServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const body = await readBody(request, options.maxRequestBytes)
+  const parsed = JSON.parse(body.toString('utf8')) as {
+    networkId: string
+    standard?: 'ERC-20' | 'BSNA-FTS1'
+    name: string
+    symbol: string
+    decimals: number
+    initialSupply: string
+    maxSupply?: string
+    supplyPolicy?: 'fixed' | 'authorized-mint'
+    burnPolicy?: 'disabled' | 'holder-burn'
+    pausePolicy?: 'disabled' | 'admin-pause'
+    metadataMutable?: boolean
+    metadataUri?: string
+    metadataHash?: string
+  }
+  if (!parsed.networkId || !parsed.name || !parsed.symbol || parsed.decimals === undefined || !parsed.initialSupply) {
+    throw AssetServiceError.invalidRequest('networkId, name, symbol, decimals, and initialSupply are required')
+  }
+  const estimate = await engine.estimateDeploymentFees(parsed)
+  // Convert bigints to strings for JSON serialization
+  const serializable = {
+    ...estimate,
+    gasLimit: estimate.gasLimit.toString(),
+    estimatedNativeFee: estimate.estimatedNativeFee.toString(),
+    maxFeePerGas: estimate.maxFeePerGas?.toString(),
+    maxPriorityFeePerGas: estimate.maxPriorityFeePerGas?.toString(),
+    gasPrice: estimate.gasPrice?.toString(),
+  }
+  sendJson(response, 200, { ok: true, estimate: serializable }, options.allowedOrigins)
+}
+
+async function handleEngineDeploy(
+  options: AssetServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const body = await readBody(request, options.maxRequestBytes)
+  const parsed = JSON.parse(body.toString('utf8')) as {
+    networkId: string
+    standard?: 'ERC-20' | 'BSNA-FTS1'
+    name: string
+    symbol: string
+    decimals: number
+    initialSupply: string
+    maxSupply?: string
+    supplyPolicy?: 'fixed' | 'authorized-mint'
+    burnPolicy?: 'disabled' | 'holder-burn'
+    pausePolicy?: 'disabled' | 'admin-pause'
+    metadataMutable?: boolean
+    metadataUri?: string
+    metadataHash?: string
+    description?: string
+    externalUrl?: string
+    logoBase64?: string
+    allowMainnet?: boolean
+  }
+  if (!parsed.networkId || !parsed.name || !parsed.symbol || parsed.decimals === undefined || !parsed.initialSupply) {
+    throw AssetServiceError.invalidRequest('networkId, name, symbol, decimals, and initialSupply are required')
+  }
+  if (!parsed.logoBase64) {
+    throw AssetServiceError.invalidRequest(
+      'logoBase64 is required for token deployment',
+    )
+  }
+  const logoBytes = Buffer.from(parsed.logoBase64, 'base64')
+  if (logoBytes.byteLength === 0) {
+    throw AssetServiceError.invalidRequest(
+      'logoBase64 must contain non-empty image bytes',
+    )
+  }
+  const result = await engine.deployFungible({
+    networkId: parsed.networkId,
+    standard: parsed.standard,
+    name: parsed.name,
+    symbol: parsed.symbol,
+    decimals: parsed.decimals,
+    initialSupply: parsed.initialSupply,
+    maxSupply: parsed.maxSupply,
+    supplyPolicy: parsed.supplyPolicy,
+    burnPolicy: parsed.burnPolicy,
+    pausePolicy: parsed.pausePolicy,
+    metadataMutable: parsed.metadataMutable,
+    metadataUri: parsed.metadataUri,
+    metadataHash: parsed.metadataHash,
+    description: parsed.description,
+    externalUrl: parsed.externalUrl,
+    logoBytes,
+    allowMainnet: parsed.allowMainnet,
+  })
+  // Convert bigints to strings for JSON serialization
+  const serializableDeployment = {
+    ...result.deployment,
+    // DeploymentRecord doesn't have bigints in the current schema
+  }
+  const serializableFeeQuote = {
+    ...result.feeQuote,
+    gasLimit: result.feeQuote.gasLimit.toString(),
+    estimatedNativeFee: result.feeQuote.estimatedNativeFee.toString(),
+    maxFeePerGas: result.feeQuote.maxFeePerGas?.toString(),
+    maxPriorityFeePerGas: result.feeQuote.maxPriorityFeePerGas?.toString(),
+    gasPrice: result.feeQuote.gasPrice?.toString(),
+  }
+  sendJson(response, 200, { ok: true, deployment: serializableDeployment, connection: result.connection, feeQuote: serializableFeeQuote }, options.allowedOrigins)
+}
+
+async function handleEngineDeployments(
+  options: AssetServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const networkId = url.searchParams.get('networkId') || undefined
+  const deployments = await engine.listDeployments(networkId)
+  sendJson(response, 200, { ok: true, deployments }, options.allowedOrigins)
+}
+
+async function handleEngineLogo(
+  options: AssetServerOptions,
+  response: ServerResponse,
+  pathname: string,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const sha256 = pathname.slice(ENGINE_LOGOS_PATH_PREFIX.length)
+  if (!/^[0-9a-f]{64}$/.test(sha256)) {
+    throw AssetServiceError.notFound('logo digest is not valid')
+  }
+  let logo: { data: Uint8Array; mediaType: string }
+  try {
+    logo = await engine.readDeploymentLogo(sha256)
+  } catch {
+    throw AssetServiceError.notFound(`no stored logo matches ${sha256}`)
+  }
+  setCommonHeaders(response, options.allowedOrigins)
+  response.setHeader('Content-Type', logo.mediaType)
+  response.setHeader('Content-Length', String(logo.data.length))
+  response.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  response.setHeader('X-Content-Type-Options', 'nosniff')
+  response.writeHead(200)
+  response.end(Buffer.from(logo.data))
+}
+
+async function handleEngineMint(
+  options: AssetServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const body = await readBody(request, options.maxRequestBytes)
+  const parsed = JSON.parse(body.toString('utf8')) as {
+    networkId?: string
+    assetId?: string
+    to?: string
+    atomicAmount?: string
+    allowMainnet?: boolean
+  }
+  if (!parsed.assetId || !parsed.to || parsed.atomicAmount === undefined) {
+    throw AssetServiceError.invalidRequest('assetId, to, and atomicAmount are required')
+  }
+  const result = await engine.mintFts1({
+    networkId: parsed.networkId,
+    assetId: parsed.assetId,
+    to: parsed.to,
+    atomicAmount: parsed.atomicAmount,
+    allowMainnet: parsed.allowMainnet ?? false,
+  })
+  sendJson(response, 200, {
+    ok: true,
+    transactionHash: result.mined.transactionHash,
+    setupTransactionHash: result.setupTransactionHash,
+    receipt: {
+      ...result.mined.receipt,
+      gasUsed: result.mined.receipt.gasUsed.toString(10),
+      effectiveGasPrice: result.mined.receipt.effectiveGasPrice.toString(10),
+    },
+    onChain: {
+      totalSupply: result.onChain.totalSupply.toString(10),
+      maxSupply: result.onChain.maxSupply.toString(10),
+      paused: result.onChain.paused,
+    },
+  }, options.allowedOrigins)
+}
+
+async function handleEngineAttachLogo(
+  options: AssetServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const engine = options.assetEngineService
+  if (engine === undefined) {
+    throw AssetServiceError.internal('asset engine service is not configured')
+  }
+  const body = await readBody(request, options.maxRequestBytes)
+  const parsed = JSON.parse(body.toString('utf8')) as { assetId: string; logoBase64: string }
+  if (!parsed.assetId || !parsed.logoBase64) {
+    throw AssetServiceError.invalidRequest('assetId and logoBase64 are required')
+  }
+  const logoBytes = Buffer.from(parsed.logoBase64, 'base64')
+  const deployment = await engine.attachLogo(parsed.assetId, logoBytes)
+  sendJson(response, 200, { ok: true, deployment }, options.allowedOrigins)
+}
+
 /**
  * Build the service options once the listener address is known.
  *
@@ -327,6 +609,10 @@ function createHttpServer(getOptions: () => AssetServerOptions | undefined): Ser
     void handleRequest(options, request, response).catch((error: unknown) => {
       if (isAssetServiceError(error)) {
         sendError(response, error, options.allowedOrigins)
+        return
+      }
+      if (error instanceof AssetEngineError) {
+        sendError(response, AssetServiceError.invalidRequest(error.message), options.allowedOrigins)
         return
       }
       sendError(response, AssetServiceError.internal(), options.allowedOrigins)
@@ -450,6 +736,89 @@ async function handleRequest(
     return
   }
 
+  // Asset Engine routes
+  if (pathname === ENGINE_NETWORKS_PATH) {
+    if (method !== 'GET') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_NETWORKS_PATH} only accepts GET requests`)
+    }
+    await handleEngineNetworks(options, response)
+    return
+  }
+
+  if (pathname === ENGINE_CONNECT_PATH) {
+    if (method !== 'POST') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_CONNECT_PATH} only accepts POST requests`)
+    }
+    await handleEngineConnect(options, request, response)
+    return
+  }
+
+  if (pathname === ENGINE_CONNECTION_PATH) {
+    if (method !== 'GET') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_CONNECTION_PATH} only accepts GET requests`)
+    }
+    await handleEngineConnection(options, response)
+    return
+  }
+
+  if (pathname === ENGINE_ESTIMATE_FEES_PATH) {
+    if (method !== 'POST') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_ESTIMATE_FEES_PATH} only accepts POST requests`)
+    }
+    await handleEngineEstimateFees(options, request, response)
+    return
+  }
+
+  if (pathname === ENGINE_DEPLOY_PATH) {
+    if (method !== 'POST') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_DEPLOY_PATH} only accepts POST requests`)
+    }
+    await handleEngineDeploy(options, request, response)
+    return
+  }
+
+  if (pathname === ENGINE_DEPLOYMENTS_PATH) {
+    if (method !== 'GET') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_DEPLOYMENTS_PATH} only accepts GET requests`)
+    }
+    await handleEngineDeployments(options, request, response)
+    return
+  }
+
+  if (pathname === ENGINE_ATTACH_LOGO_PATH) {
+    if (method !== 'POST') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_ATTACH_LOGO_PATH} only accepts POST requests`)
+    }
+    await handleEngineAttachLogo(options, request, response)
+    return
+  }
+
+  if (pathname === ENGINE_MINT_PATH) {
+    if (method !== 'POST') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed(`${ENGINE_MINT_PATH} only accepts POST requests`)
+    }
+    await handleEngineMint(options, request, response)
+    return
+  }
+
+  if (pathname.startsWith(ENGINE_LOGOS_PATH_PREFIX)) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      request.resume()
+      throw AssetServiceError.methodNotAllowed('deployment logos are served with GET requests')
+    }
+    request.resume()
+    await handleEngineLogo(options, response, pathname)
+    return
+  }
+
   request.resume()
   throw AssetServiceError.notFound(`no route matches ${pathname}`)
 }
@@ -462,6 +831,7 @@ async function handleRequest(
  */
 export async function startAssetServerFromEnv(env: NodeJS.ProcessEnv): Promise<AssetServer> {
   const config: AssetServiceConfig = loadAssetServiceConfig(env)
+  const assetEngineService = createAssetEngineServiceFromEnv(env)
   return startAssetServer(
     (defaultBaseUrl) => {
       const publicBaseUrl =
@@ -478,6 +848,7 @@ export async function startAssetServerFromEnv(env: NodeJS.ProcessEnv): Promise<A
       return {
         service,
         localObjectStore,
+        assetEngineService,
         allowedOrigins: config.allowedOrigins,
         maxRequestBytes: config.limits.maxRequestBytes,
       }

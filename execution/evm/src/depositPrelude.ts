@@ -10,7 +10,8 @@ const HASH_RE = /^[0-9a-f]{64}$/
 const ADDRESS_RE = /^0x[0-9a-f]{40}$/
 const UINT_RE = /^(0|[1-9][0-9]*)$/
 const POSITIVE_UINT_RE = /^[1-9][0-9]*$/
-const SATOSHI_TO_WEI = 10n ** 10n
+/** 1 L1 satoshi credits this many L2 native wei. 1 BTCS = 10^8 satoshis = 10^18 wei. */
+export const SATOSHI_TO_WEI = 10n ** 10n
 const MAX_UINT256 = (1n << 256n) - 1n
 const MAX_SAFE_HEIGHT = BigInt(Number.MAX_SAFE_INTEGER)
 

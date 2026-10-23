@@ -23,6 +23,7 @@ function makeReport(overrides: Partial<BtcsL1DepositReport> = {}): BtcsL1Deposit
     format: 'btcs-l2-btcs-l1-deposit-verification',
     version: 1,
     verificationModel: 'trusted-btcs-core-rpc',
+    inclusionProofVerified: false,
     depositId: overrides.depositId ?? `${resolvedTxid}:${resolvedIndex}`,
     txid: resolvedTxid,
     blockHash: overrides.blockHash ?? blockHash,

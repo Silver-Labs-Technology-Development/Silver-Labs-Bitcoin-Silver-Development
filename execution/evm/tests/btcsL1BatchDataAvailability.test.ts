@@ -103,7 +103,7 @@ async function withDirectory(run: (directory: string) => Promise<void>): Promise
 
 type Publication = Readonly<{
   batchHash: string
-  encoded: ReturnType<typeof encodeBtcsL1BatchData>
+  encoded: Awaited<ReturnType<typeof encodeBtcsL1BatchData>>
   anchorTxid: string
   fragmentTxids: readonly string[]
   transactions: readonly unknown[]
@@ -117,7 +117,7 @@ async function buildPublication(directory: string): Promise<Publication> {
   const genesis = view.getCanonicalBlockByNumber(0n)
   assert.ok(genesis)
   const batch = createEvmSettlementBatch([createEvmSettlementEnvelope(genesis.blockRlpHex)])
-  const encoded = encodeBtcsL1BatchData(batch, ANCHORS)
+  const encoded = await encodeBtcsL1BatchData(batch, ANCHORS)
   const anchorTxid = txidFor(10)
   const fragmentTxids = encoded.fragments.map((_, index) => txidFor(index + 11))
   const transactions = [
@@ -379,7 +379,7 @@ test('rejects fragment transaction containing another batch hash', async () => {
     assert.ok(child)
     const envelope1b = createE(child.blockRlpHex, envelope0b.commitmentHash)
     const batch2 = createB([envelope0b, envelope1b])
-    const enc2 = encodeB(batch2, ANCHORS)
+    const enc2 = await encodeB(batch2, ANCHORS)
     assert.notEqual(batch2.batchHash, publication.batchHash)
     const wrongHashTx = {
       txid: publication.fragmentTxids[0],

@@ -8,7 +8,7 @@ a controlled private testnet. `[x]` = done and evidenced; `[~]` = partial;
 
 - [x] Pinned Node v24.17.0 documented and used.
 - [x] `npm run typecheck` clean.
-- [x] Full EVM suite green (248/248 on 2026-10-21).
+- [x] Full EVM suite green (366 tests: 365 pass, 1 skipped live BNB, 0 fail, 187.3s on 2026-10-22).
 - [x] Deterministic store ordering (no locale-dependent comparisons).
 - [x] Deterministic transaction selection (address-sorted round-robin), covered by tests.
 - [~] End-to-end scenario execution is script-driven; no single unified orchestrator.
@@ -34,7 +34,7 @@ a controlled private testnet. `[x]` = done and evidenced; `[~]` = partial;
 - [x] Deposit-recovery gate enforced on both canonical tip-advancing entry points.
 - [x] Adoption defense-in-depth (refuses adoption while a frozen credit remains).
 - [x] Cross-process serialization via OS file lock (single host).
-- [ ] Trustless L1 inclusion (no SPV/proof); currently trusts local Core RPC.
+- [~] Local partial L1 proof verification is integrated into confirmation/deposit when `gettxoutproof` is available; the header/active chain still trusts local Core RPC, and canonical most-work selection/P2P/finality are absent. Not trustless inclusion.
 - [ ] Withdrawal/exit path with challenge semantics.
 - [ ] Fraud/validity proof architecture.
 - [ ] Multi-host coordination.
@@ -66,6 +66,10 @@ a controlled private testnet. `[x]` = done and evidenced; `[~]` = partial;
 ## Verdict
 
 Private testnet: **not ready** — Core-integration and DA/reorg paths are
-evidence-backed, but trustless inclusion, withdrawals/exit, proof architecture,
-multi-host coordination, and operations hardening remain open (see
-`SECURITY-GAP-REGISTER.md`). Mainnet: **out of scope**.
+evidence-backed, but canonical/trustless inclusion, withdrawals/exit, proof
+architecture, multi-host coordination, operations hardening, and the integrated
+wallet/explorer/NFT journey remain open (see `SECURITY-GAP-REGISTER.md` and
+`docs/PUBLIC-RELEASE-STAGES.md`). The current release status is local prototype
+**PARTIAL**, public developer test **NOT STARTED/BLOCKED**, production readiness
+**NOT GRANTED**, and public production release **NOT AUTHORIZED**. Mainnet:
+**out of scope**.

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -11,6 +11,7 @@ import {
   BtcsL1DepositWatcherDeepReorgError,
   type BtcsL1DepositWatcherRpc,
 } from '../src/btcsL1DepositWatcher.js'
+import { readDepositRecoveryGate } from '../src/depositRecoveryGate.js'
 
 const txid = 'a'.repeat(64)
 const recipientAddress = `0x${'b'.repeat(40)}`
@@ -117,14 +118,22 @@ class FakeCoreRpc implements BtcsL1DepositWatcherRpc {
 }
 
 async function withWatcher(
-  action: (directory: string, deposits: BtcsL1DepositStore, rpc: FakeCoreRpc, watcher: BtcsL1DepositWatcher) => Promise<void>,
-  options: { reorgWindowBlocks?: number } = {},
+  action: (
+    directory: string,
+    deposits: BtcsL1DepositStore,
+    rpc: FakeCoreRpc,
+    watcher: BtcsL1DepositWatcher,
+    l2Directory: string,
+  ) => Promise<void>,
+  options: { reorgWindowBlocks?: number; freezeChain?: boolean } = {},
 ): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), 'btcs-l2-deposit-watcher-'))
+  const l2Directory = join(directory, 'l2')
   let watcher: BtcsL1DepositWatcher | undefined
   try {
     const deposits = await BtcsL1DepositStore.create(join(directory, 'deposits'))
     const rpc = new FakeCoreRpc()
+    if (options.freezeChain) await mkdir(l2Directory)
     watcher = await BtcsL1DepositWatcher.create({
       rpc,
       deposits,
@@ -133,8 +142,9 @@ async function withWatcher(
       requiredConfirmations,
       startHeight: 1,
       reorgWindowBlocks: options.reorgWindowBlocks,
+      chainDirectory: options.freezeChain ? l2Directory : undefined,
     })
-    await action(join(directory, 'cursor'), deposits, rpc, watcher)
+    await action(join(directory, 'cursor'), deposits, rpc, watcher, l2Directory)
   } finally {
     await watcher?.close()
     await rm(directory, { recursive: true, force: true })
@@ -189,8 +199,45 @@ test('shallow reorg invalidates the old inclusion and re-observes it on the repl
   })
 })
 
-test('reorg deeper than retained history fails closed without changing cursor or records', async () => {
-  await withWatcher(async (cursorDirectory, deposits, rpc, watcher) => {
+test('shallow reorg that permanently removes a confirmed deposit freezes the L2 chain', async () => {
+  await withWatcher(async (_cursorDirectory, _deposits, rpc, watcher, l2Directory) => {
+    await watcher.pollOnce()
+
+    rpc.reorgFrom(2, 'r')
+    rpc.setBlock(2, rpc.activeHashes.get(2)!, [])
+    const report = await watcher.pollOnce()
+    assert.deepEqual(report.invalidatedDepositIds, [depositId])
+    assert.deepEqual(report.reobservedDepositIds, [])
+
+    const gate = await readDepositRecoveryGate(l2Directory)
+    assert.ok(gate)
+    assert.equal(gate.status, 'frozen')
+    assert.match(gate.reason, /invalidated and not re-included/)
+    assert.deepEqual(gate.involvedDepositIds, [depositId])
+  }, { freezeChain: true })
+})
+
+test('freeze retries persisted invalidations after a gate-write failure', async () => {
+  await withWatcher(async (_cursorDirectory, _deposits, rpc, watcher, l2Directory) => {
+    await watcher.pollOnce()
+
+    rpc.reorgFrom(2, 'r')
+    rpc.setBlock(2, rpc.activeHashes.get(2)!, [])
+    await rm(l2Directory, { recursive: true, force: true })
+    await assert.rejects(watcher.pollOnce())
+    assert.equal(await readDepositRecoveryGate(l2Directory), undefined)
+
+    await mkdir(l2Directory)
+    await watcher.pollOnce()
+    const gate = await readDepositRecoveryGate(l2Directory)
+    assert.ok(gate)
+    assert.equal(gate.status, 'frozen')
+    assert.deepEqual(gate.involvedDepositIds, [depositId])
+  }, { freezeChain: true })
+})
+
+test('reorg deeper than retained history fails closed and durably freezes the L2 chain', async () => {
+  await withWatcher(async (cursorDirectory, deposits, rpc, watcher, l2Directory) => {
     await watcher.pollOnce()
     const oldHash = deposits.get(depositId)?.blockHash
     const cursorBefore = await readFile(join(cursorDirectory, 'deposit-watch.json'), 'utf8')
@@ -204,7 +251,13 @@ test('reorg deeper than retained history fails closed without changing cursor or
     assert.equal(cursorAfter, cursorBefore)
     assert.equal(deposits.get(depositId)?.state, 'confirmed')
     assert.equal(deposits.get(depositId)?.blockHash, oldHash)
-  }, { reorgWindowBlocks: 1 })
+
+    const gate = await readDepositRecoveryGate(l2Directory)
+    assert.ok(gate)
+    assert.equal(gate.status, 'frozen')
+    assert.match(gate.reason, /diverged deeper/)
+    assert.deepEqual(gate.involvedDepositIds, [depositId])
+  }, { reorgWindowBlocks: 1, freezeChain: true })
 })
 
 test('transient RPC failures preserve the last completed cursor and confirmed deposit', async () => {

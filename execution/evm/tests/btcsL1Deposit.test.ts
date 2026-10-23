@@ -9,6 +9,13 @@ import {
   type BtcsL1DepositRequest,
   type BtcsL1DepositRpc,
 } from '../src/btcsL1Deposit.js'
+import {
+  HEIGHT_556_HASH,
+  HEIGHT_556_MERKLE_ROOT,
+  HEIGHT_556_PREVIOUS_HASH,
+  REAL_PROOF,
+  REAL_TXID,
+} from './fixtures/btcsL1ProofFixture.js'
 
 const txid = '1'.repeat(64)
 const blockHash = '2'.repeat(64)
@@ -119,6 +126,7 @@ test('verifies a confirmed deposit, exact recipient, payment output, and satoshi
   const report = await verifyBtcsL1Deposit(makeRpc(), request)
   assert.equal(report.format, 'btcs-l2-btcs-l1-deposit-verification')
   assert.equal(report.verificationModel, 'trusted-btcs-core-rpc')
+  assert.equal(report.inclusionProofVerified, false)
   assert.equal(report.txid, txid)
   assert.equal(report.blockHash, blockHash)
   assert.equal(report.blockHeight, 120)
@@ -231,5 +239,63 @@ test('rejects deposit output values that cannot represent whole satoshis', async
   await assert.rejects(
     verifyBtcsL1Deposit(makeRpc({ vout: makeOutputs({ paymentValue: 1e-9 }) }), request),
     /whole satoshis/,
+  )
+})
+
+function makeRealProofRpc(options: { proof?: unknown; blockHash?: string } = {}): BtcsL1DepositRpc {
+  const blockHash = options.blockHash ?? HEIGHT_556_HASH
+  return {
+    async getRawTransaction() {
+      return {
+        txid: REAL_TXID,
+        blockhash: blockHash,
+        in_active_chain: true,
+        confirmations: 10,
+        vout: makeOutputs(),
+      }
+    },
+    async getBlockHeader() {
+      return {
+        hash: blockHash,
+        height: 556,
+        confirmations: 10,
+        merkleroot: HEIGHT_556_MERKLE_ROOT,
+        previousblockhash: HEIGHT_556_PREVIOUS_HASH,
+      }
+    },
+    async getTxOutProof() {
+      return options.proof ?? REAL_PROOF
+    },
+  }
+}
+
+const realProofRequest: BtcsL1DepositRequest = {
+  ...request,
+  txid: REAL_TXID,
+  blockHash: HEIGHT_556_HASH,
+}
+
+test('verifies a real local inclusion proof for a deposit when available', async () => {
+  const report = await verifyBtcsL1Deposit(makeRealProofRpc(), realProofRequest)
+  assert.equal(
+    report.verificationModel,
+    'trusted-btcs-core-rpc+local-inclusion-proof',
+  )
+  assert.equal(report.inclusionProofVerified, true)
+  assert.equal(report.txid, REAL_TXID)
+  assert.equal(report.blockHash, HEIGHT_556_HASH)
+})
+
+test('rejects malformed or mismatched deposit inclusion proofs', async () => {
+  await assert.rejects(
+    verifyBtcsL1Deposit(makeRealProofRpc({ proof: 'zz' }), realProofRequest),
+    /lowercase hex/,
+  )
+  await assert.rejects(
+    verifyBtcsL1Deposit(
+      makeRealProofRpc({ blockHash: '8'.repeat(64) }),
+      { ...realProofRequest, blockHash: '8'.repeat(64) },
+    ),
+    /does not match the expected block hash/,
   )
 })

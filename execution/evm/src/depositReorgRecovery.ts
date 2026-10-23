@@ -6,6 +6,7 @@ import { hexToBytes } from '@ethereumjs/util'
 import {
   PersistentBlockProcessor,
   ProtocolError,
+  createIsolatedReplayDepositBackingProvider,
   type CanonicalReadView,
   type ChainTip,
 } from './blockProcessor.js'
@@ -188,7 +189,11 @@ export async function rederiveCanonicalL2AfterDepositInvalidation(
   const invalidatedSet = new Set(invalidated)
 
   await assertFreshOutputDirectory(outputDirectory)
-  const rederived = await PersistentBlockProcessor.open(outputDirectory)
+  const rederived = await PersistentBlockProcessor.open(outputDirectory, {
+    depositBackingProvider: createIsolatedReplayDepositBackingProvider(
+      view.getCanonicalDepositOperationsThroughHeight(sourceTip.number),
+    ),
+  })
 
   try {
     // Replay the canonical prefix that is unaffected by the removed credits.

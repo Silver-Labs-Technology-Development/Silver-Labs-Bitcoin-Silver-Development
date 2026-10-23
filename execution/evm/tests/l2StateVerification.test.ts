@@ -10,10 +10,28 @@ test('L2 replay verifier: verifies clean chain', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'l2verify-'))
   try {
     const chain = await PersistentBlockProcessor.open(join(dir, 'chain'))
+    const view = await chain.createCanonicalReadView()
+    const tip = view.report.blocks.at(-1)
+    assert.ok(tip)
     const result = await replayAndVerify(chain)
     assert.equal(result.valid, true)
+    assert.equal(result.stateRoot, tip.stateRoot)
+    assert.equal(result.height, view.report.tip.number)
     assert.ok(result.checked.includes('load_canonical_chain'))
     assert.ok(result.checked.includes('verify_genesis'))
+    assert.ok(result.checked.includes('reexecute_canonical_blocks'))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('L2 replay verifier: rejects an invalid replay range', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'l2verify-'))
+  try {
+    const chain = await PersistentBlockProcessor.open(join(dir, 'chain'))
+    const result = await replayAndVerify(chain, 1n)
+    assert.equal(result.valid, false)
+    assert.ok(result.errors.some((error) => error.includes('above the canonical tip')))
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

@@ -1,8 +1,12 @@
-import { ProtocolError } from './blockProcessor.js'
+import { ProtocolError, type CanonicalReadView } from './blockProcessor.js'
 import {
   verifyEvmSettlementBatch,
   type EvmSettlementBatch,
 } from './settlementBatch.js'
+import {
+  verifyEvmSettlementBatchExecution,
+  verifyEvmSettlementBatchExecutionFromCheckpoint,
+} from './settlementBatchReplay.js'
 import type { SettlementBatchAnchors } from './settlementBatchFile.js'
 
 export const BTCS_L1_BATCH_DATA_FORMAT = 'btcs-l2-l1-batch-data-fragment'
@@ -45,6 +49,46 @@ export type ReconstructedBtcsL1BatchData = Readonly<{
   serializedBatch: Buffer
   fragmentCount: number
 }>
+
+/**
+ * Execution verification needed before batch bytes may be published or
+ * accepted. Genesis batches replay from the fixed genesis; continuation
+ * batches require a recovered checkpoint and its replay-verified view.
+ */
+export type BtcsL1BatchDataExecutionVerification =
+  | Readonly<{ kind: 'genesis' }>
+  | Readonly<{
+      kind: 'checkpoint'
+      checkpointDirectory: string
+      canonicalView: CanonicalReadView
+    }>
+
+async function assertBatchExecutionVerified(
+  batch: EvmSettlementBatch,
+  anchors: SettlementBatchAnchors,
+  verification: BtcsL1BatchDataExecutionVerification,
+): Promise<void> {
+  if (verification.kind !== 'genesis' && verification.kind !== 'checkpoint') {
+    throw new ProtocolError('unsupported batch execution verification mode')
+  }
+  if (verification.kind === 'checkpoint') {
+    await verifyEvmSettlementBatchExecutionFromCheckpoint(
+      batch,
+      anchors.previousCommitment,
+      anchors.parentHash,
+      anchors.startHeight,
+      verification.checkpointDirectory,
+      verification.canonicalView,
+    )
+    return
+  }
+  await verifyEvmSettlementBatchExecution(
+    batch,
+    anchors.previousCommitment,
+    anchors.parentHash,
+    anchors.startHeight,
+  )
+}
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -108,20 +152,23 @@ function makeFragment(
 }
 
 /**
- * Verify a settlement batch and encode its deterministic JSON as bounded
- * OP_RETURN fragments. The existing batch hash is repeated in every fragment.
- * This prepares data outputs only; it does not sign or broadcast transactions.
+ * Independently re-execute a settlement batch before encoding its deterministic
+ * JSON as bounded OP_RETURN fragments. The existing batch hash is repeated in
+ * every fragment. This prepares data outputs only; it does not sign or
+ * broadcast transactions.
  */
-export function encodeBtcsL1BatchData(
+export async function encodeBtcsL1BatchData(
   batchValue: unknown,
   anchors: SettlementBatchAnchors,
-): EncodedBtcsL1BatchData {
+  verification: BtcsL1BatchDataExecutionVerification = { kind: 'genesis' },
+): Promise<EncodedBtcsL1BatchData> {
   const batch = verifyEvmSettlementBatch(
     batchValue,
     anchors.previousCommitment,
     anchors.parentHash,
     anchors.startHeight,
   )
+  await assertBatchExecutionVerified(batch, anchors, verification)
   const serializedBatch = serializeCanonicalBatch(batch)
   if (serializedBatch.byteLength === 0 || serializedBatch.byteLength > MAX_BTCS_L1_BATCH_DATA_BYTES) {
     throw new ProtocolError(
@@ -222,15 +269,17 @@ export function decodeBtcsL1BatchDataScript(
 }
 
 /**
- * Reassemble fragments collected from active-chain Core blocks and independently
- * verify both canonical bytes and the settlement batch hash against trusted
- * starting anchors. Unconfirmed/off-chain fragments must not be passed here.
+ * Reassemble fragments collected from active-chain Core blocks, verify both
+ * canonical bytes and the settlement batch hash against trusted starting
+ * anchors, and independently re-execute the batch. Unconfirmed/off-chain
+ * fragments must not be passed here.
  */
-export function reconstructEvmSettlementBatchFromScripts(
+export async function reconstructEvmSettlementBatchFromScripts(
   scripts: readonly string[],
   expectedBatchHash: string,
   anchors: SettlementBatchAnchors,
-): ReconstructedBtcsL1BatchData {
+  verification: BtcsL1BatchDataExecutionVerification = { kind: 'genesis' },
+): Promise<ReconstructedBtcsL1BatchData> {
   if (!HASH_RE.test(expectedBatchHash)) {
     throw new ProtocolError('expected batch hash must be 64 lowercase hex characters')
   }
@@ -295,6 +344,7 @@ export function reconstructEvmSettlementBatchFromScripts(
   if (batch.batchHash !== expectedBatchHash) {
     throw new ProtocolError('reconstructed settlement batch does not match its L1 commitment')
   }
+  await assertBatchExecutionVerified(batch, anchors, verification)
   return { batch, serializedBatch, fragmentCount: expectedCount }
 }
 
@@ -340,14 +390,16 @@ export function extractBtcsL1BatchDataScriptsFromCoreBlocks(
 }
 
 /** Reconstruct only after the caller fetched blocks by active-chain hash and confirmation policy. */
-export function reconstructEvmSettlementBatchFromCoreBlocks(
+export async function reconstructEvmSettlementBatchFromCoreBlocks(
   blocks: readonly unknown[],
   expectedBatchHash: string,
   anchors: SettlementBatchAnchors,
-): ReconstructedBtcsL1BatchData {
+  verification: BtcsL1BatchDataExecutionVerification = { kind: 'genesis' },
+): Promise<ReconstructedBtcsL1BatchData> {
   return reconstructEvmSettlementBatchFromScripts(
     extractBtcsL1BatchDataScriptsFromCoreBlocks(blocks),
     expectedBatchHash,
     anchors,
+    verification,
   )
 }

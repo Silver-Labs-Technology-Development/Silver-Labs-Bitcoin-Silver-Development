@@ -16,6 +16,8 @@
     "e2e:deposit": "tsx scripts/regtest-deposit-settlement-e2e.ts",
     "e2e:anchor": "tsx scripts/regtest-anchor-e2e.ts",
     "e2e:batch-data": "tsx scripts/regtest-batch-data-e2e.ts",
+    "bind:publication-continuity": "tsx scripts/bind-publication-continuity.ts",
+    "acceptance:bnb-testnet": "tsx scripts/bnb-testnet-acceptance.ts",
     "verify:batch": "tsx scripts/verify-settlement-batch.ts",
     "verify:batch:execution": "tsx scripts/verify-settlement-batch-execution.ts"
   },

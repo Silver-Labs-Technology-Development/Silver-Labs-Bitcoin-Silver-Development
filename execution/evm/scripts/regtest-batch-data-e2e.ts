@@ -176,7 +176,7 @@ async function main(): Promise<void> {
   const publicationStartHeight = (chain.blocks as number) + 1
   await rpc('getwalletinfo', [], true)
   const { batch, anchors, anchor } = await prepareBatch()
-  const encoded = encodeBtcsL1BatchData(batch, anchors)
+  const encoded = await encodeBtcsL1BatchData(batch, anchors)
   if (encoded.fragments.length > 500) {
     throw new Error('Safety stop: regtest runner is limited to 500 batch-data transactions')
   }
@@ -293,7 +293,7 @@ async function main(): Promise<void> {
     batchHash: batch.batchHash,
     requiredConfirmations: 1,
   })
-  const reconstructed = reconstructEvmSettlementBatchFromCoreBlocks(
+  const reconstructed = await reconstructEvmSettlementBatchFromCoreBlocks(
     [blockRecord],
     batch.batchHash,
     anchors,

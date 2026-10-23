@@ -2,10 +2,11 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { createBlockFromRLP } from '@ethereumjs/block'
-import { createFeeMarket1559TxFromRLP } from '@ethereumjs/tx'
+import { createFeeMarket1559Tx, createFeeMarket1559TxFromRLP, paramsTx } from '@ethereumjs/tx'
 import type { FeeMarket1559Tx } from '@ethereumjs/tx'
-import { Address, bytesToHex, hexToBytes } from '@ethereumjs/util'
-import { Bloom } from '@ethereumjs/vm'
+import { Address, bytesToHex, createZeroAddress, hexToBytes } from '@ethereumjs/util'
+import { Bloom, runTx } from '@ethereumjs/vm'
+import type { RunTxResult } from '@ethereumjs/vm'
 import {
   PersistentBlockProcessor,
   ProtocolError,
@@ -16,6 +17,9 @@ import {
   type LogRecord,
 } from './blockProcessor.js'
 import { EVM_CHAIN_ID, EVM_HARDFORK, createHarnessCommon } from './config.js'
+import {
+  DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+} from './transactions.js'
 import {
   DevelopmentSequencer,
   MAX_RAW_TRANSACTION_BYTES,
@@ -43,7 +47,7 @@ type RpcId = string | number | null
 type RpcObject = Record<string, unknown>
 type RpcResponse =
   | { jsonrpc: '2.0'; id: RpcId; result: unknown }
-  | { jsonrpc: '2.0'; id: RpcId; error: { code: number; message: string } }
+  | { jsonrpc: '2.0'; id: RpcId; error: { code: number; message: string; data?: string } }
 
 type RpcRequest = Readonly<{
   id: RpcId
@@ -72,7 +76,11 @@ export type LocalRpcServerOptions = Readonly<{
 }>
 
 class RpcFault extends Error {
-  constructor(readonly code: number, message: string) {
+  constructor(
+    readonly code: number,
+    message: string,
+    readonly data?: string,
+  ) {
     super(message)
     this.name = 'RpcFault'
   }
@@ -90,8 +98,8 @@ function createReadViewLoader(chain: PersistentBlockProcessor): ReadViewLoader {
   }
 }
 
-function fault(code: number, message: string): never {
-  throw new RpcFault(code, message)
+function fault(code: number, message: string, data?: string): never {
+  throw new RpcFault(code, message, data)
 }
 
 function invalidParams(): never {
@@ -209,8 +217,12 @@ function parseRpcRequest(value: unknown): RpcRequest {
   return { id: hasId ? (id as RpcId) : null, hasId, method: candidate.method, params }
 }
 
-function errorResponse(id: RpcId, code: number, message: string): RpcResponse {
-  return { jsonrpc: '2.0', id, error: { code, message } }
+function errorResponse(id: RpcId, code: number, message: string, data?: string): RpcResponse {
+  return {
+    jsonrpc: '2.0',
+    id,
+    error: data === undefined ? { code, message } : { code, message, data },
+  }
 }
 
 function requestError(error: unknown): RpcFault {
@@ -230,7 +242,9 @@ async function handleOne(
     return request.hasId ? { jsonrpc: '2.0', id: request.id, result } : undefined
   } catch (error) {
     const rpcError = requestError(error)
-    return request.hasId ? errorResponse(request.id, rpcError.code, rpcError.message) : undefined
+    return request.hasId
+      ? errorResponse(request.id, rpcError.code, rpcError.message, rpcError.data)
+      : undefined
   }
 }
 
@@ -662,6 +676,399 @@ function receiptJson(receipt: CanonicalReceiptData): RpcObject {
   }
 }
 
+const MAX_CALL_DATA_BYTES = 131_072
+const MAX_ACCESS_LIST_ADDRESSES = 256
+const MAX_ACCESS_LIST_SLOTS = 1_024
+const MAX_GAS_SEARCH_STEPS = 64
+const UINT256_MAX = (1n << 256n) - 1n
+const CALL_OBJECT_FIELDS = new Set([
+  'from',
+  'to',
+  'gas',
+  'gasPrice',
+  'maxFeePerGas',
+  'maxPriorityFeePerGas',
+  'value',
+  'data',
+  'input',
+  'nonce',
+  'accessList',
+  'chainId',
+  'type',
+])
+
+type AccessListEntry = Readonly<{ address: string; storageKeys: readonly string[] }>
+
+type ParsedCall = Readonly<{
+  from: Address
+  to?: Address
+  gas?: bigint
+  gasPrice?: bigint
+  maxFeePerGas?: bigint
+  maxPriorityFeePerGas?: bigint
+  value: bigint
+  data: Uint8Array
+  accessList: readonly AccessListEntry[]
+}>
+
+type SimulationOutcome =
+  | { ok: true; returnValue: Uint8Array; gasUsed: bigint }
+  | { ok: false; kind: 'out-of-gas' }
+  | { ok: false; kind: 'revert'; returnValue: Uint8Array }
+  | { ok: false; kind: 'execution'; message: string }
+
+function parseUint256Quantity(value: unknown): bigint {
+  if (
+    typeof value !== 'string' ||
+    value.length < 3 ||
+    value.length > 66 ||
+    !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/.test(value)
+  ) {
+    return invalidParams()
+  }
+  let parsed: bigint
+  try {
+    parsed = BigInt(value)
+  } catch {
+    return invalidParams()
+  }
+  if (parsed > UINT256_MAX) return invalidParams()
+  return parsed
+}
+
+function parseCallData(value: unknown): Uint8Array {
+  if (typeof value !== 'string' || !/^0x(?:[0-9a-fA-F]{2})*$/.test(value)) return invalidParams()
+  if ((value.length - 2) / 2 > MAX_CALL_DATA_BYTES) {
+    fault(-32005, 'Call data exceeds the configured size limit')
+  }
+  return hexToBytes(value as `0x${string}`)
+}
+
+function parseAccessList(value: unknown): readonly AccessListEntry[] {
+  if (!Array.isArray(value)) return invalidParams()
+  if (value.length > MAX_ACCESS_LIST_ADDRESSES) {
+    fault(-32005, 'Access list exceeds the configured limit')
+  }
+  let slots = 0
+  const entries: AccessListEntry[] = []
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return invalidParams()
+    const candidate = item as RpcObject
+    if (Object.keys(candidate).some((key) => key !== 'address' && key !== 'storageKeys')) {
+      return invalidParams()
+    }
+    const address = parseDataHex(candidate.address, 20, 'address')
+    if (!Array.isArray(candidate.storageKeys)) return invalidParams()
+    slots += candidate.storageKeys.length
+    if (slots > MAX_ACCESS_LIST_SLOTS) fault(-32005, 'Access list exceeds the configured limit')
+    const storageKeys = candidate.storageKeys.map((key) => parseDataHex(key, 32, 'storage key'))
+    entries.push({ address, storageKeys })
+  }
+  return entries
+}
+
+function parseCallObject(value: unknown): ParsedCall {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return invalidParams()
+  const candidate = value as RpcObject
+  if (Object.keys(candidate).some((key) => !CALL_OBJECT_FIELDS.has(key))) return invalidParams()
+  if (candidate.chainId !== undefined && parseUint256Quantity(candidate.chainId) !== EVM_CHAIN_ID) {
+    return invalidParams()
+  }
+  if (candidate.type !== undefined && parseUint256Quantity(candidate.type) !== 2n) return invalidParams()
+  const from = candidate.from === undefined ? createZeroAddress() : parseAddress(candidate.from)
+  const to = candidate.to === undefined || candidate.to === null ? undefined : parseAddress(candidate.to)
+  if (
+    typeof candidate.data === 'string' &&
+    typeof candidate.input === 'string' &&
+    candidate.data.toLowerCase() !== candidate.input.toLowerCase()
+  ) {
+    return invalidParams()
+  }
+  const rawData = candidate.data !== undefined ? candidate.data : candidate.input
+  if (candidate.nonce !== undefined) parseUint256Quantity(candidate.nonce)
+  return {
+    from,
+    ...(to === undefined ? {} : { to }),
+    ...(candidate.gas === undefined ? {} : { gas: parseUint256Quantity(candidate.gas) }),
+    ...(candidate.gasPrice === undefined ? {} : { gasPrice: parseUint256Quantity(candidate.gasPrice) }),
+    ...(candidate.maxFeePerGas === undefined ? {} : { maxFeePerGas: parseUint256Quantity(candidate.maxFeePerGas) }),
+    ...(candidate.maxPriorityFeePerGas === undefined
+      ? {}
+      : { maxPriorityFeePerGas: parseUint256Quantity(candidate.maxPriorityFeePerGas) }),
+    value: candidate.value === undefined ? 0n : parseUint256Quantity(candidate.value),
+    data: rawData === undefined ? new Uint8Array() : parseCallData(rawData),
+    accessList: candidate.accessList === undefined ? [] : parseAccessList(candidate.accessList),
+  }
+}
+
+function parseSimulationParams(params: unknown): { call: ParsedCall; reference: BlockReference } {
+  if (!Array.isArray(params) || params.length < 1 || params.length > 2) return invalidParams()
+  return {
+    call: parseCallObject(params[0]),
+    reference: params.length === 2 ? parseBlockReference(params[1]) : 'latest',
+  }
+}
+
+let transactionGasCapValue: bigint | undefined
+
+/** EIP-7825 cap from the same transaction parameters FeeMarket1559Tx installs. */
+function transactionGasCap(): bigint {
+  if (transactionGasCapValue === undefined) {
+    const common = createHarnessCommon()
+    common.updateParams(paramsTx)
+    transactionGasCapValue = common.param('maxTransactionGasLimit')
+  }
+  return transactionGasCapValue
+}
+
+function cappedGasLimit(requested: bigint | undefined, blockGasLimit: bigint): bigint {
+  const cap = transactionGasCap()
+  let gasLimit = requested ?? blockGasLimit
+  if (gasLimit > blockGasLimit) gasLimit = blockGasLimit
+  if (gasLimit > cap) gasLimit = cap
+  return gasLimit
+}
+
+function resolveFees(
+  call: ParsedCall,
+  baseFee: bigint,
+): { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } {
+  if (
+    call.gasPrice !== undefined &&
+    (call.maxFeePerGas !== undefined || call.maxPriorityFeePerGas !== undefined)
+  ) {
+    return invalidParams()
+  }
+  if (call.gasPrice !== undefined) {
+    if (call.gasPrice < baseFee) fault(-32000, 'max fee per gas is below the block base fee')
+    return { maxFeePerGas: call.gasPrice, maxPriorityFeePerGas: call.gasPrice }
+  }
+  let maxPriorityFeePerGas = call.maxPriorityFeePerGas ?? DEFAULT_MAX_PRIORITY_FEE_PER_GAS
+  const maxFeePerGas = call.maxFeePerGas ?? (baseFee + maxPriorityFeePerGas)
+  if (call.maxPriorityFeePerGas === undefined && maxPriorityFeePerGas > maxFeePerGas) {
+    maxPriorityFeePerGas = maxFeePerGas
+  }
+  if (maxPriorityFeePerGas > maxFeePerGas) return invalidParams()
+  if (maxFeePerGas < baseFee) fault(-32000, 'max fee per gas is below the block base fee')
+  return { maxFeePerGas, maxPriorityFeePerGas }
+}
+
+function executionMessage(error: unknown): string {
+  if (!(error instanceof Error) || error.message.length === 0) return 'Execution failed'
+  // runTx appends " (vm hf=… -> block -> tx)" after the actionable reason.
+  const reason = error.message.replace(/\s+\(vm\b[\s\S]*$/, '').trim()
+  if (reason.length === 0) return 'Execution failed'
+  return reason.length <= 300 ? reason : `${reason.slice(0, 297)}...`
+}
+
+function isIntrinsicGasError(error: unknown): boolean {
+  return error instanceof Error && /intrinsic gas/i.test(error.message)
+}
+
+function classifyRun(result: RunTxResult): SimulationOutcome {
+  const exception = result.execResult.exceptionError
+  if (exception === undefined) {
+    return {
+      ok: true,
+      returnValue: result.execResult.returnValue,
+      gasUsed: result.totalGasSpent,
+    }
+  }
+  if (exception.error === 'out of gas' || exception.error === 'code store out of gas') {
+    return { ok: false, kind: 'out-of-gas' }
+  }
+  if (exception.error === 'revert') {
+    return { ok: false, kind: 'revert', returnValue: result.execResult.returnValue }
+  }
+  return { ok: false, kind: 'execution', message: exception.error }
+}
+
+function throwOutcome(outcome: SimulationOutcome, allowance?: bigint): never {
+  if (outcome.ok) throw new Error('successful execution has no RPC error')
+  if (outcome.kind === 'revert') {
+    fault(3, 'execution reverted', bytesToHex(outcome.returnValue))
+  }
+  if (outcome.kind === 'out-of-gas') {
+    fault(
+      -32000,
+      allowance === undefined
+        ? 'out of gas'
+        : `gas required exceeds allowance (${quantity(allowance)})`,
+    )
+  }
+  fault(-32000, outcome.message)
+}
+
+function createSimulationTransaction(
+  call: ParsedCall,
+  fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint },
+  gasLimit: bigint,
+  nonce: bigint,
+): FeeMarket1559Tx {
+  const tx = createFeeMarket1559Tx(
+    {
+      chainId: EVM_CHAIN_ID,
+      nonce,
+      gasLimit,
+      maxFeePerGas: fees.maxFeePerGas,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+      value: call.value,
+      data: call.data,
+      ...(call.to === undefined ? {} : { to: call.to }),
+      ...(call.accessList.length === 0
+        ? {}
+        : {
+            accessList: call.accessList.map((entry) => ({
+              address: entry.address as `0x${string}`,
+              storageKeys: entry.storageKeys.map((key) => key as `0x${string}`),
+            })),
+          }),
+    },
+    { common: createHarnessCommon(), freeze: false },
+  )
+  Object.defineProperty(tx, 'getSenderAddress', {
+    configurable: true,
+    value: () => call.from,
+  })
+  return tx
+}
+
+async function executeSimulation(
+  view: CanonicalReadView,
+  blockNumber: bigint,
+  call: ParsedCall,
+  fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint },
+  gasLimit: bigint,
+): Promise<SimulationOutcome> {
+  const isolated = await view.isolateExecutionVm(blockNumber)
+  try {
+    const account = await isolated.vm.stateManager.getAccount(call.from)
+    const balance = account?.balance ?? 0n
+    const nonce = account?.nonce ?? 0n
+    let tx: FeeMarket1559Tx
+    try {
+      tx = createSimulationTransaction(call, fees, gasLimit, nonce)
+    } catch (error) {
+      return { ok: false, kind: 'execution', message: executionMessage(error) }
+    }
+    const maxCost = gasLimit * fees.maxFeePerGas + call.value
+    const skipBalance = call.value <= balance && balance < maxCost
+    try {
+      const result = await runTx(isolated.vm, {
+        tx,
+        block: isolated.block,
+        skipNonce: true,
+        skipBalance,
+      })
+      return classifyRun(result)
+    } catch (error) {
+      if (isIntrinsicGasError(error)) return { ok: false, kind: 'out-of-gas' }
+      return { ok: false, kind: 'execution', message: executionMessage(error) }
+    }
+  } finally {
+    await view.assertCanonicalStateUnchanged(blockNumber)
+  }
+}
+
+async function performEthCall(readView: ReadViewLoader, params: unknown): Promise<string> {
+  const { call, reference } = parseSimulationParams(params)
+  const view = await readView()
+  const blockNumber = resolveBlockReference(reference, view.report.tip.number)
+  if (blockNumber > view.report.tip.number) return invalidParams()
+  const block = view.getCanonicalBlockByNumber(blockNumber)
+  if (block === undefined) return invalidParams()
+  const header = parseBlockRlp(block).header
+  const baseFee = header.baseFeePerGas ?? 0n
+  const fees = resolveFees(call, baseFee)
+  const gasLimit = cappedGasLimit(call.gas, header.gasLimit)
+  const outcome = await executeSimulation(view, blockNumber, call, fees, gasLimit)
+  if (!outcome.ok) throwOutcome(outcome)
+  return bytesToHex(outcome.returnValue)
+}
+
+async function performEthEstimateGas(readView: ReadViewLoader, params: unknown): Promise<string> {
+  const { call, reference } = parseSimulationParams(params)
+  const view = await readView()
+  const blockNumber = resolveBlockReference(reference, view.report.tip.number)
+  if (blockNumber > view.report.tip.number) return invalidParams()
+  const canonical = view.getCanonicalBlockByNumber(blockNumber)
+  if (canonical === undefined) return invalidParams()
+  const header = parseBlockRlp(canonical).header
+  const baseFee = header.baseFeePerGas ?? 0n
+  const fees = resolveFees(call, baseFee)
+  const balance = await view.getAccountBalance(call.from, blockNumber)
+  if (call.value > balance) fault(-32000, 'insufficient funds for transfer')
+  let high = cappedGasLimit(call.gas, header.gasLimit)
+  if (fees.maxFeePerGas > 0n) {
+    const affordable = (balance - call.value) / fees.maxFeePerGas
+    if (affordable < high) high = affordable
+  }
+  if (high === 0n) fault(-32000, 'insufficient funds for gas * price + value')
+
+  const run = (gasLimit: bigint) => executeSimulation(view, blockNumber, call, fees, gasLimit)
+  const ceiling = await run(high)
+  if (!ceiling.ok) throwOutcome(ceiling, high)
+  let low = 0n
+  if (ceiling.gasUsed > 0n && ceiling.gasUsed < high) {
+    const atUsed = await run(ceiling.gasUsed)
+    if (atUsed.ok) {
+      const below = await run(ceiling.gasUsed - 1n)
+      if (!below.ok && below.kind === 'out-of-gas') return quantity(ceiling.gasUsed)
+      if (!below.ok) throwOutcome(below, high)
+      high = ceiling.gasUsed - 1n
+    } else if (atUsed.kind === 'out-of-gas') {
+      low = ceiling.gasUsed
+    } else {
+      throwOutcome(atUsed, high)
+    }
+  }
+
+  let steps = 0
+  while (low + 1n < high) {
+    if (steps >= MAX_GAS_SEARCH_STEPS) fault(-32603, 'Internal error')
+    steps += 1
+    const mid = (low + high) / 2n
+    const outcome = await run(mid)
+    if (outcome.ok) high = mid
+    else if (outcome.kind === 'out-of-gas') low = mid
+    else throwOutcome(outcome, high)
+  }
+  return quantity(high)
+}
+
+function pendingTransactionJson(tx: FeeMarket1559Tx, baseFee: bigint) {
+  const yParity = tx.v
+  if (yParity === undefined || tx.r === undefined || tx.s === undefined) {
+    throw new Error('pending transaction is missing signature values')
+  }
+  const gasPrice = tx.maxFeePerGas < baseFee ? tx.maxFeePerGas : effectiveGasPrice(tx, baseFee)
+  return {
+    blockHash: null,
+    blockNumber: null,
+    from: tx.getSenderAddress().toString().toLowerCase(),
+    gas: quantity(tx.gasLimit),
+    gasPrice: quantity(gasPrice),
+    maxFeePerGas: quantity(tx.maxFeePerGas),
+    maxPriorityFeePerGas: quantity(tx.maxPriorityFeePerGas),
+    type: quantity(BigInt(tx.type)),
+    accessList: tx.accessList.map(([address, slots]) => ({
+      address: normalizedBytes(address),
+      storageKeys: slots.map(normalizedBytes),
+    })),
+    chainId: quantity(tx.chainId),
+    hash: normalizedBytes(tx.hash()),
+    input: normalizedBytes(tx.data),
+    nonce: quantity(tx.nonce),
+    to: tx.to?.toString().toLowerCase() ?? null,
+    transactionIndex: null,
+    value: quantity(tx.value),
+    v: quantity(yParity),
+    r: quantity(tx.r),
+    s: quantity(tx.s),
+    yParity: quantity(yParity),
+  }
+}
+
 async function dispatch(
   readView: ReadViewLoader,
   method: string,
@@ -702,6 +1109,45 @@ async function dispatch(
       const transactionHash = parseDataHex(hash, 32, 'transaction hash')
       const receipt = (await readView()).getCanonicalReceiptByTransactionHash(transactionHash)
       return receipt === undefined ? null : receiptJson(receipt)
+    }
+    case 'eth_getTransactionByHash': {
+      const [hash] = paramsArray(params, 1)
+      const transactionHash = parseDataHex(hash, 32, 'transaction hash')
+      const view = await readView()
+      const receipt = view.getCanonicalReceiptByTransactionHash(transactionHash)
+      if (receipt !== undefined) {
+        const block = parseBlockRlp(receipt.block)
+        const tx = createFeeMarket1559TxFromRLP(
+          hexToBytes(receipt.transactionRlpHex as `0x${string}`),
+          { common: createHarnessCommon() },
+        )
+        return fullTransactionJson(tx, block, receipt.block.summary.hash, receipt.transactionIndex)
+      }
+      if (developmentSequencer !== undefined) {
+        const pending = await developmentSequencer.findPendingTransaction(transactionHash)
+        if (pending !== undefined) {
+          const tip = view.getCanonicalBlockByNumber(view.report.tip.number)
+          if (tip === undefined) throw new Error('canonical tip block is missing')
+          return pendingTransactionJson(pending, parseBlockRlp(tip).header.calcNextBaseFee())
+        }
+      }
+      return null
+    }
+    case 'eth_call':
+      return performEthCall(readView, params)
+    case 'eth_estimateGas':
+      return performEthEstimateGas(readView, params)
+    case 'net_version': {
+      paramsArray(params, 0)
+      return EVM_CHAIN_ID.toString(10)
+    }
+    case 'net_listening': {
+      paramsArray(params, 0)
+      return false
+    }
+    case 'net_peerCount': {
+      paramsArray(params, 0)
+      return quantity(0n)
     }
     case 'eth_getCode': {
       const [address, reference] = paramsArray(params, 2)
@@ -1004,7 +1450,3 @@ export async function startLocalRpcServer(
     }),
   }
 }
-
-// Withdrawal RPC methods
-import { WithdrawalService } from './withdrawalService.js'
-import { L1PayoutAdapter } from './l1PayoutAdapter.js'

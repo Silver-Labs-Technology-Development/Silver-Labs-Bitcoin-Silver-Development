@@ -29,3 +29,13 @@ not published to BTCS, and this run therefore does not establish data
 availability or reconstruction from L1. It also did not run the optional
 destructive reorg scenario. Verification trusts local BTCS Core RPC and is a
 regtest prototype result, not production settlement finality.
+
+## Superseded harness note (2026-10-22)
+
+The live result above predates the store-bound continuity change. The current
+harness requires `BTCS_L2_CONTINUITY_STORE_DIR` and a fresh continuity directory
+for a new genesis run, and it refuses an unbound legacy publication store. Bind
+an existing store explicitly with
+`npm run bind:publication-continuity -- <publication-dir> <continuity-dir>`.
+Rerun the live E2E with isolated publication and continuity directories before
+citing it as current evidence.

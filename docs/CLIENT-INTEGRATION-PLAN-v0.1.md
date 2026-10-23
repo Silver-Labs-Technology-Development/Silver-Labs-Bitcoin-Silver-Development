@@ -173,10 +173,17 @@ Hard client-facing properties:
 
 ### 1.8 Wallet / account tooling — MISSING
 
+> **Product decision update, 2026-10-22:** SilverPay is the unified Silver
+> Labs wallet-and-payments product. SilverPay Wallet is Phase 1 and the initial
+> priority; SilverPay Payments is a later milestone. The separate Silver Wallet
+> product is retired from the roadmap, and the empty sibling
+> `~/Silver-Labs/silver-wallet` repository is **not** a required dependency.
+> See `docs/ARCHITECTURE-DECISION-RECORD-SILVERPAY-2026-10-22.md`.
+
 - No EIP-1193/EIP-6963 provider, no injected provider, no key management, no
-  browser wallet, no `eth_accounts`/`eth_sign`, no chain-add metadata, no
-  `silver-wallet` integration. A sibling repository `~/Silver-Labs/silver-wallet`
-  exists but is not referenced by this project.
+  browser wallet, no `eth_accounts`/`eth_sign`, no chain-add metadata, and no
+  SilverPay wallet integration. The sibling repository
+  `~/Silver-Labs/silver-wallet` is empty and is not referenced by this project.
 - No user identity exists on L2 beyond a raw EVM address; the only funded key is
   the documented test key (`execution/evm/src/config.ts:6-8`).
 
@@ -236,8 +243,12 @@ transfer.
    `execution/evm/scripts/regtest-deposit-settlement-e2e.ts:366-443`).
 
 **Where it breaks.**
-- Verification trusts the local Core RPC; there is no SPV or inclusion proof
-  (`execution/evm/src/btcsL1Deposit.ts:140-148`).
+- Verification trusts the local Core RPC for the header and active chain. A
+  local header/PoW and partial Merkle-proof verifier
+  (`execution/evm/src/l1HeaderVerifier.ts`) is now integrated into deposit and
+  confirmation when the RPC exposes `gettxoutproof`, but it does not select the
+  most-work chain or establish finality
+  (`execution/evm/src/btcsL1Deposit.ts`, `btcsL1Confirmation.ts`).
 - No escrow: the L1 funds are not provably locked, so a reorg or double-spend
   policy is unresolved. The code explicitly warns that a registry entry alone is
   not a safe bridge (`execution/evm/src/btcsL1DepositWorkflow.ts:15-19`).
@@ -334,7 +345,7 @@ challenge window, backed by published L2 data and an L1-anchored state root.
 | L1 anchor prepare/sign/broadcast/observe/confirm lifecycle | PARTIAL (trusted RPC) | `src/btcsL1Publication*.ts`, `scripts/regtest-anchor-e2e.ts` |
 | Portable batch file verify CLI | IMPLEMENTED | `src/settlementBatchFile.ts`, `scripts/verify-settlement-batch*.ts` |
 | Smart contracts (arbitrary EVM) | PARTIAL (no tooling) | `contracts/Counter.sol`, `src/compile.ts` |
-| Wallet / EIP-1193 / key management | MISSING | no provider/source files exist |
+| Wallet / EIP-1193 / key management | MISSING | no provider/source files exist; SilverPay Wallet is the owned Phase 1 target |
 | Public RPC, auth, rate limiting, remote access | MISSING | RPC doc `:45-66,219-224` |
 | Withdrawals / exit / bridge | MISSING | pool doc `:141-147` |
 | Data availability design | MISSING | `docs/SETTLEMENT.md:156-170` |
@@ -370,9 +381,11 @@ Goal: any developer can start the L2 and read data with the pinned runtime.
   typecheck && npm test` and `npm run rpc` on a fresh directory, and gets a
   valid `eth_chainId` response.
 
-### Phase 1 — Wallet-grade read RPC (weeks)
+### Phase 1 — SilverPay Wallet-grade read RPC (weeks)
 
 Goal: an unmodified EVM wallet or a thin client can display and prepare actions.
+This eventually feeds SilverPay Wallet Phase 1; it does not by itself prove the
+wallet journey or enable payments.
 
 Proposed additive methods (read-only, no protocol change):
 - `eth_call` with a documented non-committing execution context and a
@@ -473,9 +486,13 @@ is defined (`docs/BTCS-L2-RPC-v0.12-DRAFT.md:39-43,219-224`).
   (`docs/BTCS-L2-TRANSACTION-POOL-v0.14-DRAFT.md:62-76,96-102`).
 - Only type-2 transactions are supported; the EVM chain ID `31337` is
   development-only (`docs/BTCS-L2-BLOCK-PROTOCOL-v0.11-DRAFT.md:91-95`).
-- Deposit verification trusts the local BTCS Core RPC; there is no trustless
-  inclusion proof, escrow, fraud/validity proof, or data availability
-  (`execution/evm/src/btcsL1Deposit.ts:140-148`, `docs/SETTLEMENT.md:156-184`).
+- Deposit verification trusts the local BTCS Core RPC for the header and active
+  chain; there is no canonical/trustless inclusion proof, escrow,
+  fraud/validity proof, or data availability. A local header/PoW and partial
+  Merkle-proof verifier is integrated when `gettxoutproof` is available, but it
+  does not establish canonical-chain selection or finality
+  (`execution/evm/src/btcsL1Deposit.ts`, `btcsL1Confirmation.ts`,
+  `docs/SETTLEMENT.md:156-184`).
 - **Withdrawals do not exist.** L2 assets cannot currently exit to L1
   (`docs/BTCS-L2-TRANSACTION-POOL-v0.14-DRAFT.md:141-147`).
 - Anchoring publishes a commitment via OP_RETURN; publication alone is not

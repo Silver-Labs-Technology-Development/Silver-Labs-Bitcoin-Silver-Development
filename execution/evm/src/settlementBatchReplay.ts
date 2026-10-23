@@ -6,6 +6,7 @@ import {
   LOCAL_CHAIN_PROFILE,
   PersistentBlockProcessor,
   ProtocolError,
+  createIsolatedReplayDepositBackingProvider,
   reexecuteFromVerifiedCheckpoint,
   type CanonicalReadView,
 } from './blockProcessor.js'
@@ -59,7 +60,11 @@ export async function verifyEvmSettlementBatchExecution(
 
   const directory = await mkdtemp(join(tmpdir(), 'btcs-l2-independent-replay-'))
   try {
-    const processor = await PersistentBlockProcessor.open(directory)
+    const processor = await PersistentBlockProcessor.open(directory, {
+      depositBackingProvider: createIsolatedReplayDepositBackingProvider(
+        batch.envelopes.flatMap((envelope) => envelope.depositOperations),
+      ),
+    })
     let blocksVerified = 0
     let childBlocksReexecuted = 0
 
