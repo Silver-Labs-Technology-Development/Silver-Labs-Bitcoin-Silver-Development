@@ -16,7 +16,7 @@ function App() {
           <NavLink to="/nodes" className="nav-link">Nodes</NavLink>
           <NavLink to="/tokens" className="nav-link">Token Studio</NavLink>
           <NavLink to="/transactions" className="nav-link">Transactions</NavLink>
-          <NavLink to="/silverpay" className="nav-link">SilverPay Wallet</NavLink>
+          <NavLink to="/silverpay" className="nav-link">SilverPay</NavLink>
         </div>
         <div style={{ color: 'var(--warning)', fontSize: '0.875rem' }}>⚠ EXPERIMENTAL - Trusted Single-Operator</div>
       </nav>

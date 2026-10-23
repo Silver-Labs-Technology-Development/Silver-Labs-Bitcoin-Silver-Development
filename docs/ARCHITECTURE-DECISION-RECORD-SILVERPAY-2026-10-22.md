@@ -1,4 +1,4 @@
-# Architecture Decision Record: SilverPay Is the Unified Wallet and Payments Product
+# Architecture Decision Record: SilverPay Is the Unified Wallet, Account, and Payments Product
 
 Date: 2026-10-22  
 Status: **DECIDED — product direction; implementation not complete**  
@@ -14,12 +14,12 @@ The BTCS L2 repository has a **read-only Phase 1 slice**, not a complete wallet 
 
 1. **SilverPay is the single Silver Labs wallet-and-payments product.**
 2. **The separate Silver Wallet product is retired from the roadmap.** Existing BTCS Silver Wallet application work is not a required service, package, repository, or runtime dependency.
-3. **SilverPay Phase 1 is SilverPay Wallet** and is the initial delivery priority.
-4. **SilverPay Phase 2 is SilverPay Payments** and is a later milestone, gated on verified transaction, settlement, accounting, and security capabilities.
+3. **SilverPay's initial functionality is its wallet and account foundation.** "Wallet" describes the first capabilities of SilverPay, not a separate product or application.
+4. **Payment processing and merchant services are later SilverPay capabilities**, gated on verified transaction, settlement, accounting, and security capabilities. They are not a separate payment application.
 5. **SilverForge and Silver Scan remain separate products** integrated with SilverPay. SilverPay does not absorb their responsibilities.
 6. Existing wallet-related internal components may be reused when they pass security and compatibility review. Reuse must not turn an external wallet into a mandatory dependency.
 
-## Phase 1 — SilverPay Wallet
+## Initial functionality — SilverPay wallet and account foundation
 
 The first usable developer-test wallet must provide, where the underlying services genuinely support it:
 
@@ -55,9 +55,9 @@ configured Core RPC and L2 reads trust the configured L2 RPC; the service has no
 canonical L1 proof, L2 state proof, finality check, authentication, or TLS. It
 must remain loopback-only.
 
-## Phase 2 — SilverPay Payments
+## Later functionality — SilverPay payments and merchant services
 
-Payments are deliberately later. Candidate capabilities include payment requests, QR payloads, merchant checkout, invoices, transaction-status tracking, reconciliation, and settlement integration. These are not implemented by the current prototype.
+Payments are deliberately later capabilities within SilverPay. Candidate capabilities include payment requests, QR payloads, merchant checkout, invoices, transaction-status tracking, reconciliation, and settlement integration. These are not implemented by the current prototype and do not constitute a separate product or application.
 
 A payment flow may be described as complete only when it uses verified technical capabilities and reconciles against authoritative transaction and settlement records. Submitting a transaction is not proof of payment completion.
 
@@ -79,9 +79,9 @@ A payment flow may be described as complete only when it uses verified technical
 
 ## Acceptance gates
 
-SilverPay Wallet is not complete until the required local journey runs end to end against real services:
+SilverPay's initial wallet and account functionality is not complete until the required local journey runs end to end against real services:
 
-`create/deploy an asset → see it in SilverPay Wallet → inspect it in Silver Scan → send from account A to B → receive and verify → restart → verify again`
+`create/deploy an asset → see it in SilverPay → inspect it in Silver Scan → send from account A to B → receive and verify → restart → verify again`
 
 Only the read-only L1/L2 observation part of this journey exists. The acceptance
 gate is therefore unmet; see `docs/PUBLIC-RELEASE-STAGES.md`.

@@ -1,9 +1,11 @@
 # SilverPay read-only service
 
-Local, loopback-only HTTP gateway for the SilverPay Wallet Phase 1 preview. It
-reads the configured BTCS L1 Core wallet and BTCS L2 EVM account state. It does
-not hold keys, sign, send, receive, recover wallets, submit L2 transactions, or
-process payments.
+Local, loopback-only HTTP gateway for SilverPay's initial read-only wallet and
+account experience. SilverPay is one unified wallet, account, and
+digital-asset-management product; payment processing and merchant services
+are later milestones. This gateway reads configured BTCS L1 Core wallet and
+BTCS L2 EVM account state. It does not hold keys, sign, send, receive, recover
+wallets, submit L2 transactions, or process payments.
 
 ## Status
 

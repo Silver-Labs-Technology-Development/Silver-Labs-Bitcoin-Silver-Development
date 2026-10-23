@@ -328,12 +328,12 @@ function SilverPayWallet() {
     <div className="container">
       <div className="silverpay-title-row">
         <div>
-          <div className="eyebrow">SilverPay · Phase 1</div>
-          <h1 className="silverpay-title">SilverPay Wallet</h1>
+          <div className="eyebrow">SilverPay · Wallet foundation</div>
+          <h1 className="silverpay-title">SilverPay</h1>
           <p className="muted silverpay-intro">
-            A real read-only view of the configured BTCS L1 Core wallet and an
-            independent BTCS L2 EVM account. L1 UTXO identity and L2 account
-            identity are kept separate.
+            SilverPay is the unified wallet, account, and digital-asset
+            experience. This read-only preview keeps the configured BTCS L1
+            Core wallet and BTCS L2 EVM account separate.
           </p>
         </div>
         <button className="btn btn-secondary" onClick={refresh} disabled={status.loading || account.loading}>
@@ -343,8 +343,8 @@ function SilverPayWallet() {
 
       <div className="warning">
         <strong>Read-only preview.</strong> Balances are read from the configured
-        nodes. Signing, sending, receiving, recovery, transaction history, and
-        SilverPay payment requests are not implemented. Do not send funds to
+        nodes. Signing, sending, receiving, recovery, transaction history, and future
+        SilverPay payment features are not implemented. Do not send funds to
         addresses shown here based on this preview.
       </div>
 
@@ -375,7 +375,11 @@ function SilverPayWallet() {
           </div>
           <div>
             <strong>Not implemented</strong>
-            <p>Signing, send/receive, recovery, payment requests, QR checkout, invoices, history, and L2 transaction submission.</p>
+            <p>
+              Signing, send/receive, recovery, transaction history, and L2
+              transaction submission are not implemented. Payment and merchant
+              features are later SilverPay milestones.
+            </p>
           </div>
         </div>
       </div>
