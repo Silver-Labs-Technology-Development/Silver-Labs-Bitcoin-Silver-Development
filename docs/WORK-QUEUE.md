@@ -342,3 +342,16 @@ Older rows below were written before this audit. Where they disagree with the au
 | BTCS-L2-GUI-015 | Mint tab asset engine integration | READY_FOR_REVIEW | studio/src/pages/TokenStudio.jsx, services/asset-service/src/assetEngineService.ts, services/asset-service/src/httpServer.ts, execution/evm/src/assetEngine/session.ts | Mint tab lists registry deployments whose supply policy is authorized-mint, posts to `/api/asset-engine/mint`, and displays the real transaction hash and on-chain total supply. The engine sets the deployer as minter when the contract has no minter and the deployer is admin. Fixed-supply and legacy ERC-20 deployments are refused before signing. |
 | BTCS-L2-GUI-016 | Integrated end-to-end test workflow | PARTIAL | services/asset-service/tests/httpAssetEngineFts1.test.ts | Automated HTTP test covers connect, ERC-20 deploy, BSNA-FTS1 deploy, registry list, logo serving, authorized mint, and fixed-supply mint refusal. A manual browser flow with service restart is still required. |
 | BTCS-L2-GUI-017 | Alpha distribution documentation | READY_FOR_REVIEW | docs/TEAM-TESTING-GUIDE.md, docs/KNOWN-LIMITATIONS.md, docs/SECURITY-AND-TEST-NETWORK-BOUNDARIES.md | Documents installation, workflows, limitations, and security boundaries. Must be rechecked against the final test counts before distribution. |
+
+## Standalone SilverForge static frontend — 2026-10-23
+
+This workstream is a separate local frontend, not a replacement for the
+backend-dependent `studio/` or asset engine above. Status is based on local
+source and tests; no repository push or public deployment is confirmed.
+
+| Task ID | Task | Status | Deliverable | Next action |
+|---|---|---|---|---|
+| SILVERFORGE-STATIC-001 | Static wallet-authorized Ethereum and BNB fixed-supply token flow | IMPLEMENTED / LOCAL PROTOTYPE | `/home/user/Silver-Labs/SilverForge-Studio` | Establish the approved private organization repository and development branch; run wallet tests on Sepolia and BSC Testnet. |
+| SILVERFORGE-STATIC-002 | Solana classic SPL mint and immutable Metaplex metadata flow | IMPLEMENTED / LOCAL PROTOTYPE | `/home/user/Silver-Labs/SilverForge-Studio` | Obtain independent review of the serialized instruction/account layouts and test on Devnet. |
+| SILVERFORGE-STATIC-003 | Static GitHub Pages build and CI | BUILD / TEST ONLY | Vite build and `.github/workflows/ci.yml` in the standalone frontend | Keep Pages publishing disabled until explicit owner approval; then review repository Pages settings and deployment workflow separately. |
+| SILVERFORGE-STATIC-004 | BTCS L2 adapter | PLANNED / NOT IMPLEMENTED | None | Implement only after the L2 wallet, chain identity, fee asset, standard, and deployment contract are verified; until then keep the option disabled. |

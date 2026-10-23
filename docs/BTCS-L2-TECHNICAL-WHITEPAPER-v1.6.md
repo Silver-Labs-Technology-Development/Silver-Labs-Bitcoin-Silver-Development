@@ -3582,3 +3582,29 @@ SilverPay must not depend on the existing BTCS Silver Wallet application. Compat
 - A payment is not complete merely because a transaction was submitted.
 
 **Constraints:** No mandatory dependency on the existing BTCS Silver Wallet application. SilverForge and Silver Scan remain separate integrated products. Existing BTCS L1/L2 security restrictions remain in force; unsafe withdrawals and production financial features are not enabled to make the wallet appear complete. The detailed decision is in `docs/ARCHITECTURE-DECISION-RECORD-SILVERPAY-2026-10-22.md`.
+
+# 101. SilverForge Static Frontend Boundary — 2026-10-23
+
+The standalone SilverForge Studio frontend is a browser-only engineering
+prototype intended for static hosting. Its current external-chain adapters
+target Ethereum and BNB Smart Chain EVM deployments and Solana classic SPL
+tokens. These deployments use the selected external chain's wallet, RPC,
+programs/contracts, fee asset, and explorer; they are not BTCS L2 deployments
+and do not imply cross-network transfer or settlement.
+
+**BTCS L2 remains under development and is disabled in the static frontend.**
+No BTCS L2 wallet, fee, token-standard, RPC, or deployment integration is
+implemented by that standalone frontend. The existing backend-dependent Studio
+and asset-engine code in this repository is separate work and remains intact.
+BSNA-F1 conformance and integration remain subject to the requirements in
+Sections 90 and 94; a generic external-chain token is not thereby a BSNA asset.
+
+The frontend requires wallet-authorized signing and does not collect seed
+phrases or private keys. Solana metadata requires URLs hosted by the user on
+public HTTPS storage; GitHub Pages, if later approved, serves static frontend
+files only and is not a metadata service, RPC provider, or private backend.
+Local tests and builds do not demonstrate live-chain operation or production
+security. Pages publishing remains gated on explicit owner approval. No
+v1.8.3 whitepaper was present in the inspected local checkout; this dated
+boundary is recorded in the available v1.6 document without changing its
+version label.
