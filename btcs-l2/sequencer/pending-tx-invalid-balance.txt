@@ -1,1 +1,0 @@
-BTCSL2TX|v0.7|id=5|from=alice|to=bob|amount=9999|nonce=3

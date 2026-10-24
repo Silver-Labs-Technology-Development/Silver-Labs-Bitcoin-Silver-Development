@@ -1,7 +1,0 @@
-.regtest/
-*.log
-__pycache__/
-
-studio/node_modules/
-studio/dist/
-services/silverpay-service/node_modules/

@@ -1,3 +1,0 @@
-alice=900
-bob=60
-carol=40
