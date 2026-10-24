@@ -1,0 +1,3 @@
+alice=1000
+bob=0
+carol=0
