@@ -8,13 +8,17 @@ Bitcoin Silver aims to enhance the original Bitcoin network by:
 - **Faster Transactions**: Improving transaction speeds to ensure a more efficient and scalable network.
 - **Continuous Development**: Regular updates and community-driven enhancements to keep the network secure and up-to-date.
 
-## Silver Labs L2 Development Branch
+## Silver Labs L2 Integration
 
-BTCS L2 development is maintained on the `silver-labs-l2` branch. The
-standalone EVM prototype, Studio, and supporting services are under
-[`btcs-l2/`](./btcs-l2/README.md) on that branch. They remain experimental:
-the local trusted-operator model is not production-ready and does not provide
-trustless settlement or real-fund safety.
+The `silver-labs-l2` branch contains Core-side L2 RPC integration work.
+Standalone L2 execution, services, Studio, and token tooling are developed in
+the public [BTCS L2 repository](https://github.com/Silver-Labs-Technology-Development/btcs-l2).
+The product direction is one coordinated BTCS installation with an integrated
+GUI, but no unified installer or production L2 release is currently available.
+Keep the development repositories distinct; coordinate compatible versions
+and integration tests before packaging. L2 remains experimental: the local
+trusted-operator model is not production-ready and does not provide trustless
+settlement or real-fund safety.
 
 ## Features
 
